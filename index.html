@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="description" content="Zombie Surge - мрачный браузерный шутер в лесу." />
+    <title>Zombie Surge</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=Unbounded:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
+    <script src="firebase-config.js"></script>
+    <script defer src="game.js"></script>
+  </head>
+  <body>
+    <div class="ember-layer" aria-hidden="true"></div>
+    <div class="site">
+      <header class="hero">
+        <div class="brand">ТЁМНЫЙ ЛЕС</div>
+        <h1>Zombie Surge</h1>
+        <p>
+          Мрачный шутер в густом лесу. Защити ядро, переживи волны и удержи рощу живой.
+        </p>
+        <div class="cta">
+          <button class="primary" id="startBtn" type="button">Начать</button>
+          <button class="ghost" id="scrollBtn" type="button">Как играть</button>
+        </div>
+        <div class="auth-panel">
+          <div class="auth-top">
+            <div class="auth-user">
+              <div class="auth-meta">
+                <div class="auth-name" id="authName">Гость</div>
+                <div class="auth-sub" id="authSub">Войди, чтобы сохранить прогресс</div>
+              </div>
+            </div>
+            <div class="auth-actions">
+              <button class="primary auth-google" id="loginBtn" type="button">🔐 Вход / Регистрация</button>
+              <button class="ghost" id="logoutBtn" type="button" hidden>Выйти</button>
+            </div>
+          </div>
+
+          <div class="auth-methods" id="authMethods" hidden>
+            <div class="auth-provider-row">
+              <button class="ghost auth-provider-btn auth-provider-google" id="loginGoogleBtn" type="button">🔵 Google</button>
+              <button class="ghost auth-provider-btn" id="showEmailBtn" type="button">✉️ Email / Пароль</button>
+            </div>
+            <div class="auth-email-form" id="emailAuthForm" hidden>
+              <input id="emailInput" class="auth-input" type="email" autocomplete="email" placeholder="Email" />
+              <input id="passwordInput" class="auth-input" type="password" autocomplete="current-password" placeholder="Пароль (мин. 6 символов)" />
+              <div class="auth-email-actions">
+                <button class="primary" id="emailSignInBtn" type="button">Войти</button>
+                <button class="ghost" id="emailSignUpBtn" type="button">Создать аккаунт</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="auth-message" id="authMessage" hidden></div>
+        </div>
+      </header>
+
+      <main class="game-shell" id="gameSection">
+        <div class="control-panel">
+          <div class="hud">
+            <div class="stat">
+              <span class="label">Очки</span>
+              <span class="value" id="score">0</span>
+            </div>
+            <div class="stat">
+              <span class="label">Волна</span>
+              <span class="value" id="wave">1</span>
+            </div>
+            <div class="stat">
+              <span class="label">Жизни</span>
+              <span class="value" id="hp">5</span>
+            </div>
+            <div class="stat">
+              <span class="label">Комбо</span>
+              <span class="value" id="combo">0</span>
+            </div>
+          </div>
+
+          <div class="control-row">
+            <div class="quick-actions">
+              <button class="ghost" id="pauseBtn" type="button">⏸ Пауза</button>
+              <button class="ghost" id="restartBtn" type="button">🔁 Заново</button>
+              <button class="ghost" id="soundBtn" type="button">🔊 Звук: Вкл</button>
+            </div>
+
+            <div class="weapon-select" id="weaponSelect" role="group" aria-label="Weapon select">
+              <button class="ghost weapon-btn" data-weapon="blaster" type="button"><span class="weapon-icon">🔫</span><span class="weapon-name">Бластер</span></button>
+              <button class="ghost weapon-btn" data-weapon="shotgun" type="button"><span class="weapon-icon">💥</span><span class="weapon-name">Дробовик</span></button>
+              <button class="ghost weapon-btn" data-weapon="beam" type="button"><span class="weapon-icon">⚡</span><span class="weapon-name">Луч</span></button>
+              <button class="ghost weapon-btn" data-weapon="grenade" type="button"><span class="weapon-icon">💣</span><span class="weapon-name">Граната</span></button>
+            </div>
+          </div>
+
+          <div class="status-line" id="statusLine">Статус: спокойно</div>
+
+          <div class="coop-panel" id="coopPanel">
+            <div class="coop-head">
+              <h4>🤝 Кооп-оборона (2 ядра)</h4>
+              <span class="coop-room-code" id="coopRoomCode">Лобби: —</span>
+            </div>
+            <div class="coop-actions">
+              <button class="ghost" id="coopCreateBtn" type="button">Создать лобби</button>
+              <input id="coopCodeInput" type="text" maxlength="6" placeholder="Код лобби" autocomplete="off" />
+              <button class="ghost" id="coopJoinBtn" type="button">Войти</button>
+              <button class="ghost" id="coopLeaveBtn" type="button" hidden>Выйти</button>
+            </div>
+            <p class="coop-status" id="coopStatus">Войди в аккаунт, чтобы открыть кооп-лобби.</p>
+            <div class="coop-cores" id="coopCores" hidden>
+              <div class="coop-core">
+                <span>Твоё ядро</span>
+                <strong id="coopOwnCore">HP: 5/5</strong>
+              </div>
+              <div class="coop-core">
+                <span id="coopAllyLabel">Ядро союзника</span>
+                <strong id="coopAllyCore">HP: —</strong>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="canvas-wrap">
+          <canvas id="gameCanvas" aria-label="Zombie Surge игровое поле"></canvas>
+          <div class="vignette"></div>
+          <div class="overlay" id="overlay">
+            <div class="overlay-card">
+              <div class="tag">Аркада</div>
+              <h2 id="overlayTitle">Готов?</h2>
+              <p id="overlayText">
+                Клик или тап — выстрел. Удерживай для авто-стрельбы. Береги ядро и
+                набирай комбо.
+              </p>
+              <button class="primary" id="playBtn" type="button">Играть</button>
+            </div>
+          </div>
+        </div>
+
+        <section class="rules" id="rules">
+          <div class="rule-card">
+            <h3>Как играть</h3>
+            <p>Клик или тап — выстрел. Зомби бегут к ядру в центре.</p>
+          </div>
+          <div class="rule-card">
+            <h3>Выживание</h3>
+            <p>Каждый зомби, коснувшийся ядра, отнимает жизнь. Держись дольше.</p>
+          </div>
+          <div class="rule-card">
+            <h3>Комбо</h3>
+            <p>Серия быстрых попаданий даёт больше очков и ускоряет волны.</p>
+          </div>
+        </section>
+
+        <section class="leaderboard">
+          <div class="leaderboard-head">
+            <h3>Рейтинг игроков</h3>
+            <button class="ghost" id="refreshLeaderboardBtn" type="button">Обновить</button>
+          </div>
+          <p class="leaderboard-note" id="leaderboardStatus">
+            Рейтинг открыт всем. Для сохранения прогресса нужен вход.
+          </p>
+          <div class="profile-stats">
+            <div class="profile-stat">
+              <span>Лучший счёт</span>
+              <strong id="myBest">-</strong>
+            </div>
+            <div class="profile-stat">
+              <span>Игр сыграно</span>
+              <strong id="myGames">-</strong>
+            </div>
+            <div class="profile-stat">
+              <span>Время в игре</span>
+              <strong id="myPlaytime">-</strong>
+            </div>
+          </div>
+          <div class="leaderboard-table-wrap">
+            <table class="leaderboard-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Игрок</th>
+                  <th>Лучший счёт</th>
+                  <th>Игр</th>
+                  <th>Время</th>
+                </tr>
+              </thead>
+              <tbody id="leaderboardBody">
+                <tr>
+                  <td colspan="5" class="empty-row">Рейтинг загружается...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Магазин и Прокачка -->
+        <section class="shop" id="shop">
+          <div class="shop-head">
+            <h2>⚒️ Магазин и Прокачка</h2>
+            <p>Открывай оружие, усиливай билд и зарабатывай золото за каждую игру.</p>
+          </div>
+          <div class="shop-gold-display" id="shopGoldDisplay">
+            <span class="shop-gold-label">🪙 ТВОЁ ЗОЛОТО</span>
+            <span class="shop-gold-value" id="shopGoldAmount">0</span>
+          </div>
+          
+          <div class="shop-tabs">
+            <button class="shop-tab active" data-shop-tab="upgrades">💪 Прокачка</button>
+            <button class="shop-tab" data-shop-tab="weapons">🔫 Оружие</button>
+          </div>
+          
+          <div class="shop-content active" id="shopUpgrades">
+            <div class="upgrade-grid">
+              <div class="upgrade-card">
+                <div class="upgrade-icon">❤️</div>
+                <h4>Лечение</h4>
+                <p class="upgrade-desc">Восстановить HP в начале игры</p>
+                <div class="upgrade-impact" id="hpImpact">Стартовый бонус: +0 HP → +2 HP</div>
+                <div class="upgrade-level">Уровень: <span id="hpLevel">1</span></div>
+                <div class="upgrade-cost">Цена: <span id="hpCost">50</span> 🪙</div>
+                <button class="upgrade-btn" id="hpUpgradeBtn" onclick="upgradeStat('hpLevel')">Прокачать</button>
+              </div>
+              
+              <div class="upgrade-card">
+                <div class="upgrade-icon">🛡️</div>
+                <h4>Макс. HP</h4>
+                <p class="upgrade-desc">Увеличить максимальное здоровье</p>
+                <div class="upgrade-impact" id="maxHpImpact">Макс. здоровье: 5 HP → 10 HP</div>
+                <div class="upgrade-level">Уровень: <span id="maxHpLevel">1</span></div>
+                <div class="upgrade-cost">Цена: <span id="maxHpCost">80</span> 🪙</div>
+                <button class="upgrade-btn" id="maxHpUpgradeBtn" onclick="upgradeStat('maxHpLevel')">Прокачать</button>
+              </div>
+            </div>
+          </div>
+          
+          <div class="shop-content" id="shopWeapons">
+            <div class="weapon-shop-grid" id="weaponShopGrid">
+              <!-- Оружие генерируется JS -->
+            </div>
+          </div>
+        </section>
+
+        <!-- Энциклопедия -->
+        <section class="encyclopedia">
+          <div class="encyclo-tabs">
+            <button class="encyclo-tab active" data-tab="zombies">🧟 Зомби</button>
+            <button class="encyclo-tab" data-tab="weapons">🔫 Оружие</button>
+            <button class="encyclo-tab" data-tab="events">🌪️ События</button>
+          </div>
+          
+          <div class="encyclo-content active" id="zombies">
+            <div class="encyclo-grid">
+              <div class="encyclo-card zombie-entry zombie-entry-normal">
+                <div class="encyclo-zombie-preview">
+                  <div class="encyclo-zombie-hp">HP: 2</div>
+                  <canvas class="encyclo-zombie-canvas" data-zombie-preview="normal" width="140" height="120"></canvas>
+                </div>
+                <h4>Обычный</h4>
+                <p>Базовый зомби. Медленный, но опасен в больших количествах.</p>
+                <div class="encyclo-stats"><span>Speed: ★★★☆☆</span><span>Роль: Массовый</span></div>
+              </div>
+              <div class="encyclo-card zombie-entry zombie-entry-fast">
+                <div class="encyclo-zombie-preview">
+                  <div class="encyclo-zombie-hp">HP: 1</div>
+                  <canvas class="encyclo-zombie-canvas" data-zombie-preview="fast" width="140" height="120"></canvas>
+                </div>
+                <h4>Быстрый</h4>
+                <p>Маленький и очень быстрый. Сложно попасть!</p>
+                <div class="encyclo-stats"><span>Speed: ★★★★★</span><span>Роль: Прорыв</span></div>
+              </div>
+              <div class="encyclo-card zombie-entry zombie-entry-tank">
+                <div class="encyclo-zombie-preview">
+                  <div class="encyclo-zombie-hp">HP: 5</div>
+                  <canvas class="encyclo-zombie-canvas" data-zombie-preview="tank" width="140" height="120"></canvas>
+                </div>
+                <h4>Танк</h4>
+                <p>Большой и живучий. Нужно много выстрелов.</p>
+                <div class="encyclo-stats"><span>Speed: ★★☆☆☆</span><span>Роль: Поглотитель урона</span></div>
+              </div>
+              <div class="encyclo-card zombie-entry zombie-entry-dash">
+                <div class="encyclo-zombie-preview">
+                  <div class="encyclo-zombie-hp">HP: 2</div>
+                  <canvas class="encyclo-zombie-canvas" data-zombie-preview="dash" width="140" height="120"></canvas>
+                </div>
+                <h4>Рывок</h4>
+                <p>Периодически делает быстрый рывок вперёд.</p>
+                <div class="encyclo-stats"><span>Speed: ★★★★☆</span><span>Роль: Давление</span></div>
+              </div>
+              <div class="encyclo-card zombie-entry zombie-entry-boss">
+                <div class="encyclo-zombie-preview">
+                  <div class="encyclo-zombie-hp">HP: 22+</div>
+                  <canvas class="encyclo-zombie-canvas" data-zombie-preview="boss" width="140" height="120"></canvas>
+                </div>
+                <h4>Босс</h4>
+                <p>Появляется каждые 10 волн. Очень опасен!</p>
+                <div class="encyclo-stats"><span>Speed: ★★☆☆☆</span><span>Роль: Босс-цель</span></div>
+              </div>
+            </div>
+          </div>
+          
+          <div class="encyclo-content" id="weapons">
+            <div class="encyclo-grid">
+              <div class="encyclo-card">
+                <div class="encyclo-icon weapon-blaster">🔫</div>
+                <h4>Бластер</h4>
+                <p>Основное оружие. Быстрый и точный. Хорош для новичков.</p>
+                <div class="encyclo-stats"><span>CD: 220мс</span><span>DMG: 1.0</span></div>
+              </div>
+              <div class="encyclo-card">
+                <div class="encyclo-icon weapon-shotgun">💥</div>
+                <h4>Дробовик</h4>
+                <p>Стреляет несколькими пулями. Очень эффективен вблизи.</p>
+                <div class="encyclo-stats"><span>CD: 620мс</span><span>Пули: 5</span></div>
+              </div>
+              <div class="encyclo-card">
+                <div class="encyclo-icon weapon-beam">⚡</div>
+                <h4>Луч</h4>
+                <p>Непрерывный лазер. Попадание мгновенное. Лучший выбор!</p>
+                <div class="encyclo-stats"><span>Тип: Лазер</span><span>Урон/сек: 6.5</span></div>
+              </div>
+              <div class="encyclo-card">
+                <div class="encyclo-icon weapon-grenade">💣</div>
+                <h4>Граната</h4>
+                <p>Взрывается при контакте или через время. Большой урон по площади.</p>
+                <div class="encyclo-stats"><span>CD: 900мс</span><span>Радиус: 70px</span></div>
+              </div>
+            </div>
+          </div>
+          
+          <div class="encyclo-content" id="events">
+            <div class="encyclo-grid">
+              <div class="encyclo-card weather-live-card">
+                <h4>🌦️ Живая погода</h4>
+                <p>Погода и время суток меняются в бою и влияют на видимость, спавн и точность.</p>
+                <div class="atmosphere-tags">
+                  <span class="atmo-tag" id="atmoTimeBadge">🕓 Вечер</span>
+                  <span class="atmo-tag" id="atmoWeatherBadge">🌤️ Ясно</span>
+                </div>
+                <p class="atmosphere-effect" id="atmoEffectText">Стабильная видимость и стандартный темп волн.</p>
+                <div class="atmosphere-meters">
+                  <div class="atmo-meter">
+                    <span>Видимость</span>
+                    <strong id="atmoVisibilityValue">100%</strong>
+                  </div>
+                  <div class="atmo-meter">
+                    <span>Спавн</span>
+                    <strong id="atmoSpawnValue">100%</strong>
+                  </div>
+                  <div class="atmo-meter">
+                    <span>Точность</span>
+                    <strong id="atmoAccuracyValue">100%</strong>
+                  </div>
+                </div>
+              </div>
+              <div class="encyclo-card event-card fog">
+                <div class="encyclo-icon">🌫️</div>
+                <h4>Туман</h4>
+                <p>Видимость ухудшается. Зомби появляются чаще.</p>
+                <div class="encyclo-stats"><span>Скорость: ×1</span><span>Появление: ×1.05</span></div>
+              </div>
+              <div class="encyclo-card event-card rage">
+                <div class="encyclo-icon">😡</div>
+                <h4>Ярость</h4>
+                <p>Зомби становятся агрессивнее и быстрее.</p>
+                <div class="encyclo-stats"><span>Скорость: ×1.35</span><span>Появление: ×1.35</span></div>
+              </div>
+              <div class="encyclo-card event-card night">
+                <div class="encyclo-icon">🌙</div>
+                <h4>Ночь</h4>
+                <p>Экран темнеет. Очень много зомби! Больше очков.</p>
+                <div class="encyclo-stats"><span>Скорость: ×1.1</span><span>Появление: ×1.6</span><span>Очки: ×2</span></div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        Сделано для открытого веба. Музыка на сайте: "Omega" — Scott Buckley (CC-BY 4.0).
+        <a href="https://www.scottbuckley.com.au" target="_blank" rel="noopener">scottbuckley.com.au</a>
+      </footer>
+    </div>
+  </body>
+</html>
