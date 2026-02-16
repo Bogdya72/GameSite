@@ -72,7 +72,9 @@ const COOP_INPUT_SYNC_INTERVAL_WS_MS = 75;
 const COOP_WORLD_SYNC_INTERVAL_WS_MS = 82;
 const COOP_WORLD_MAX_ZOMBIES = 24;
 const COOP_WORLD_MAX_ZOMBIES_WS = 18;
-const COOP_GUEST_FX_STEP_MS = 90;
+const COOP_WORLD_MAX_BULLETS = 42;
+const COOP_WORLD_MAX_BURSTS = 26;
+const COOP_GUEST_FX_STEP_MS = 16;
 const COOP_GUEST_TARGET_FRAME_MS = 16;
 const COOP_WS_REQUEST_TIMEOUT_MS = 45000;
 const COOP_WS_RECONNECT_BASE_MS = 450;
@@ -87,6 +89,14 @@ const ZOMBIE_TYPE_TO_CODE = {
 };
 
 const ZOMBIE_CODE_TO_TYPE = ["normal", "fast", "tank", "dash", "boss"];
+
+const BURST_TYPE_TO_CODE = {
+  shot: 0,
+  kill: 1,
+  blast: 2,
+};
+
+const BURST_CODE_TO_TYPE = ["shot", "kill", "blast"];
 
 const coopState = {
   active: false,
@@ -749,6 +759,24 @@ function serializeCoopWorldSnapshot() {
 
       return [Number(zombie.id), xNorm, yNorm, rNorm, hp10, maxHp10, typeCode, targetCode];
     }),
+    b: state.bullets.slice(0, COOP_WORLD_MAX_BULLETS).map((bullet) => {
+      const xNorm = Math.round(clamp((Number(bullet.x) || 0) / baseWidth, 0, 1) * 10000);
+      const yNorm = Math.round(clamp((Number(bullet.y) || 0) / baseHeight, 0, 1) * 10000);
+      const vxNorm = Math.round(clamp((Number(bullet.vx) || 0) / 2200, -1, 1) * 10000);
+      const vyNorm = Math.round(clamp((Number(bullet.vy) || 0) / 2200, -1, 1) * 10000);
+      const rNorm = Math.round(clamp((Number(bullet.r) || 3) / baseMin, 0.0015, 0.08) * 10000);
+      const typeCode = bullet.type === "grenade" ? 1 : 0;
+      const life100 = Math.max(0, Math.round((Number(bullet.life) || 0) * 100));
+      return [xNorm, yNorm, vxNorm, vyNorm, rNorm, typeCode, life100];
+    }),
+    u: state.bursts.slice(0, COOP_WORLD_MAX_BURSTS).map((burst) => {
+      const xNorm = Math.round(clamp((Number(burst.x) || 0) / baseWidth, 0, 1) * 10000);
+      const yNorm = Math.round(clamp((Number(burst.y) || 0) / baseHeight, 0, 1) * 10000);
+      const typeCode = BURST_TYPE_TO_CODE[String(burst.type || "shot")] ?? 0;
+      const life100 = Math.max(0, Math.round((Number(burst.life) || 0) * 100));
+      const max100 = Math.max(1, Math.round((Number(burst.max) || Number(burst.life) || 0.2) * 100));
+      return [xNorm, yNorm, typeCode, life100, max100];
+    }),
   };
 }
 
@@ -759,6 +787,8 @@ function applyCoopWorldSnapshot(world) {
 
   const zombiesRaw = Array.isArray(world.z) ? world.z : world.zombies;
   if (!Array.isArray(zombiesRaw)) return;
+  const bulletsRaw = Array.isArray(world.b) ? world.b : Array.isArray(world.bullets) ? world.bullets : null;
+  const burstsRaw = Array.isArray(world.u) ? world.u : Array.isArray(world.bursts) ? world.bursts : null;
 
   coopState.worldVersion = version || Date.now();
   const prevScore = state.score;
@@ -880,6 +910,89 @@ function applyCoopWorldSnapshot(world) {
   }
 
   state.zombies = next;
+
+  if (Array.isArray(bulletsRaw)) {
+    const localVisualBullets = isGuestMirrorMode()
+      ? state.bullets.filter((bullet) => bullet?.origin === "local" && Number(bullet.life) > 0)
+      : [];
+    const nextBullets = [];
+    const worldBullets = bulletsRaw.slice(0, COOP_WORLD_MAX_BULLETS);
+    for (let index = 0; index < worldBullets.length; index += 1) {
+      const bullet = worldBullets[index];
+      if (Array.isArray(bullet)) {
+        const xNorm = clamp((Number(bullet[0]) || 0) / 10000, 0, 1);
+        const yNorm = clamp((Number(bullet[1]) || 0) / 10000, 0, 1);
+        const vxNorm = clamp((Number(bullet[2]) || 0) / 10000, -1, 1);
+        const vyNorm = clamp((Number(bullet[3]) || 0) / 10000, -1, 1);
+        const rNorm = clamp((Number(bullet[4]) || 0) / 10000, 0.0015, 0.08);
+        const typeCode = Math.round(Number(bullet[5]) || 0);
+        const life100 = Math.max(0, Number(bullet[6]) || 0);
+        nextBullets.push({
+          x: xNorm * targetWidth,
+          y: yNorm * targetHeight,
+          vx: vxNorm * 2200,
+          vy: vyNorm * 2200,
+          r: Math.max(2, rNorm * targetMin),
+          life: life100 / 100,
+          damage: 0,
+          splash: typeCode === 1 ? (WEAPONS.grenade.splash || 70) : 0,
+          type: typeCode === 1 ? "grenade" : "bullet",
+          origin: "remote",
+        });
+      } else if (bullet && typeof bullet === "object") {
+        nextBullets.push({
+          x: (Number(bullet.x) || 0) * scaleX,
+          y: (Number(bullet.y) || 0) * scaleY,
+          vx: Number(bullet.vx) || 0,
+          vy: Number(bullet.vy) || 0,
+          r: Math.max(2, (Number(bullet.r) || 3) * radiusScale),
+          life: Math.max(0, Number(bullet.life) || 0.4),
+          damage: 0,
+          splash: Number(bullet.splash) || 0,
+          type: String(bullet.type || "bullet"),
+          origin: "remote",
+        });
+      }
+    }
+    state.bullets = [...nextBullets, ...localVisualBullets].slice(0, COOP_WORLD_MAX_BULLETS + 16);
+  }
+
+  if (Array.isArray(burstsRaw)) {
+    const localVisualBursts = isGuestMirrorMode()
+      ? state.bursts.filter((burst) => burst?.origin === "local" && Number(burst.life) > 0)
+      : [];
+    const nextBursts = [];
+    const worldBursts = burstsRaw.slice(0, COOP_WORLD_MAX_BURSTS);
+    for (let index = 0; index < worldBursts.length; index += 1) {
+      const burst = worldBursts[index];
+      if (Array.isArray(burst)) {
+        const xNorm = clamp((Number(burst[0]) || 0) / 10000, 0, 1);
+        const yNorm = clamp((Number(burst[1]) || 0) / 10000, 0, 1);
+        const typeCode = Math.round(Number(burst[2]) || 0);
+        const life100 = Math.max(0, Number(burst[3]) || 0);
+        const max100 = Math.max(1, Number(burst[4]) || life100 || 20);
+        nextBursts.push({
+          x: xNorm * targetWidth,
+          y: yNorm * targetHeight,
+          type: BURST_CODE_TO_TYPE[typeCode] || "shot",
+          life: life100 / 100,
+          max: max100 / 100,
+          origin: "remote",
+        });
+      } else if (burst && typeof burst === "object") {
+        nextBursts.push({
+          x: (Number(burst.x) || 0) * scaleX,
+          y: (Number(burst.y) || 0) * scaleY,
+          type: String(burst.type || "shot"),
+          life: Math.max(0, Number(burst.life) || 0.15),
+          max: Math.max(0.05, Number(burst.max) || Number(burst.life) || 0.15),
+          origin: "remote",
+        });
+      }
+    }
+    state.bursts = [...nextBursts, ...localVisualBursts].slice(0, COOP_WORLD_MAX_BURSTS + 14);
+  }
+
   if (prevScore !== state.score || prevWave !== state.wave || !isGuestMirrorMode()) {
     updateHud();
   }
@@ -2265,6 +2378,12 @@ function syncCoopWorldState(now) {
     snapshot.w,
     (snapshot.z || [])
       .map((zombie) => (Array.isArray(zombie) ? zombie.join(":") : [zombie.i, zombie.x, zombie.y, zombie.r, zombie.h, zombie.c].join(":")))
+      .join(";"),
+    (snapshot.b || [])
+      .map((bullet) => (Array.isArray(bullet) ? bullet.join(":") : [bullet.x, bullet.y, bullet.vx, bullet.vy, bullet.r, bullet.type, bullet.life].join(":")))
+      .join(";"),
+    (snapshot.u || [])
+      .map((burst) => (Array.isArray(burst) ? burst.join(":") : [burst.x, burst.y, burst.type, burst.life, burst.max].join(":")))
       .join(";"),
   ].join("|");
   if (snapshotKey === coopState.lastWorldPayloadKey) {
@@ -4120,9 +4239,6 @@ function playDamageSound() {
 function getCanvasRenderDpr() {
   const rawDpr = window.devicePixelRatio || 1;
   const isSmallScreen = window.matchMedia("(max-width: 900px)").matches;
-  if (isGuestMirrorMode()) {
-    return Math.min(rawDpr, isSmallScreen ? 1 : 1.2);
-  }
   if (isSmallScreen) {
     return Math.min(rawDpr, 1.2);
   }
@@ -4552,7 +4668,18 @@ function spawnBullet({ x, y, vx, vy, life, r, damage, type = "bullet", splash = 
     const damageBonus = getWeaponDamageBonus(authState.profile, state.weapon);
     damage = damage * (1 + damageBonus);
   }
-  state.bullets.push({ x, y, vx, vy, life, r, damage, type, splash });
+  state.bullets.push({
+    x,
+    y,
+    vx,
+    vy,
+    life,
+    r,
+    damage,
+    type,
+    splash,
+    origin: isGuestMirrorMode() ? "local" : "host",
+  });
 }
 
 function getAccuracyJitter(baseSpread = 0.04) {
@@ -4641,7 +4768,14 @@ function shoot(targetX, targetY, now) {
     });
   }
 
-  state.bursts.push({ x: originX, y: originY, life: 0.18, max: 0.18, type: "shot" });
+  state.bursts.push({
+    x: originX,
+    y: originY,
+    life: 0.18,
+    max: 0.18,
+    type: "shot",
+    origin: isGuestMirrorMode() ? "local" : "host",
+  });
   playShotSound();
 }
 
@@ -4990,14 +5124,11 @@ function update(dt, now) {
   const guestMirror = isGuestMirrorMode();
   updateWave();
 
-  const shouldUpdateVisualState = !guestMirror || now - coopState.lastGuestFxAt >= COOP_GUEST_FX_STEP_MS;
-  if (shouldUpdateVisualState) {
-    updateAtmosphere(dt);
-    updateEffects(dt);
-    updateEvent(dt);
-    if (guestMirror) {
-      coopState.lastGuestFxAt = now;
-    }
+  updateAtmosphere(dt);
+  updateEffects(dt);
+  updateEvent(dt);
+  if (guestMirror) {
+    coopState.lastGuestFxAt = now;
   }
 
   // Update muzzle flash
@@ -5017,9 +5148,14 @@ function update(dt, now) {
   state.beamActive = false;
   state.beamTarget = null;
 
-  if (!guestMirror && state.pointer.down) {
+  if (state.pointer.down) {
     if (state.weapon === "beam") {
-      fireBeam(dt, now);
+      if (guestMirror) {
+        state.beamActive = true;
+        state.beamTarget = { x: state.pointer.x, y: state.pointer.y };
+      } else {
+        fireBeam(dt, now);
+      }
     } else {
       shoot(state.pointer.x, state.pointer.y, now);
     }
@@ -5203,48 +5339,51 @@ function update(dt, now) {
         state.bullets.splice(i, 1);
       }
     }
-  } else if (state.bullets.length > 0) {
-    state.bullets = [];
+  } else {
+    for (let i = state.bullets.length - 1; i >= 0; i -= 1) {
+      const bullet = state.bullets[i];
+      bullet.x += (Number(bullet.vx) || 0) * dt;
+      bullet.y += (Number(bullet.vy) || 0) * dt;
+      bullet.life = Math.max(0, (Number(bullet.life) || 0) - dt);
+
+      if (bullet.type === "grenade" && bullet.life <= 0) {
+        state.bursts.push({ x: bullet.x, y: bullet.y, life: 0.34, max: 0.34, type: "blast" });
+        state.bullets.splice(i, 1);
+        continue;
+      }
+
+      if (bullet.life <= 0 || bullet.x < -90 || bullet.x > width + 90 || bullet.y < -90 || bullet.y > height + 90) {
+        state.bullets.splice(i, 1);
+      }
+    }
   }
 
-  if (!guestMirror || shouldUpdateVisualState) {
-    for (let i = state.bursts.length - 1; i >= 0; i -= 1) {
-      const burst = state.bursts[i];
-      burst.life -= dt;
-      if (burst.life <= 0) {
-        state.bursts.splice(i, 1);
-      }
+  for (let i = state.bursts.length - 1; i >= 0; i -= 1) {
+    const burst = state.bursts[i];
+    burst.life -= dt;
+    if (burst.life <= 0) {
+      state.bursts.splice(i, 1);
     }
+  }
 
-    for (let i = state.particles.length - 1; i >= 0; i -= 1) {
-      const particle = state.particles[i];
-      particle.x += particle.vx * dt;
-      particle.y += particle.vy * dt;
-      particle.vx *= 0.92;
-      particle.vy *= 0.92;
-      particle.life -= dt;
-      if (particle.life <= 0) {
-        state.particles.splice(i, 1);
-      }
+  for (let i = state.particles.length - 1; i >= 0; i -= 1) {
+    const particle = state.particles[i];
+    particle.x += particle.vx * dt;
+    particle.y += particle.vy * dt;
+    particle.vx *= 0.92;
+    particle.vy *= 0.92;
+    particle.life -= dt;
+    if (particle.life <= 0) {
+      state.particles.splice(i, 1);
     }
+  }
 
-    for (let i = state.floaters.length - 1; i >= 0; i -= 1) {
-      const floater = state.floaters[i];
-      floater.y -= 28 * dt;
-      floater.life -= dt;
-      if (floater.life <= 0) {
-        state.floaters.splice(i, 1);
-      }
-    }
-  } else {
-    if (state.bursts.length > 24) {
-      state.bursts.splice(0, state.bursts.length - 24);
-    }
-    if (state.particles.length > 70) {
-      state.particles.splice(0, state.particles.length - 70);
-    }
-    if (state.floaters.length > 18) {
-      state.floaters.splice(0, state.floaters.length - 18);
+  for (let i = state.floaters.length - 1; i >= 0; i -= 1) {
+    const floater = state.floaters[i];
+    floater.y -= 28 * dt;
+    floater.life -= dt;
+    if (floater.life <= 0) {
+      state.floaters.splice(i, 1);
     }
   }
   updateRemoteTracers(dt);
@@ -5895,10 +6034,7 @@ function drawEventOverlay() {
 }
 
 function getVisualQualityScale() {
-  let scale = width <= 900 ? 0.78 : 1;
-  if (isGuestMirrorMode()) {
-    scale *= width <= 900 ? 0.52 : 0.62;
-  }
+  const scale = width <= 900 ? 0.78 : 1;
   return clamp(scale, 0.35, 1);
 }
 
@@ -5921,16 +6057,6 @@ function drawAtmosphereOverlay(now = performance.now()) {
   if (darkness > 0.01) {
     ctx.fillStyle = `rgba(2, 6, 10, ${darkness})`;
     ctx.fillRect(0, 0, width, height);
-  }
-
-  if (isGuestMirrorMode()) {
-    if (state.atmosphere.lightning > 0) {
-      const alpha = clamp(state.atmosphere.lightning * 0.38, 0, 0.38);
-      ctx.fillStyle = `rgba(225, 242, 255, ${alpha})`;
-      ctx.fillRect(0, 0, width, height);
-    }
-    ctx.restore();
-    return;
   }
 
   if (modifiers.weatherRain > 0.01) {
@@ -5976,7 +6102,6 @@ function drawAtmosphereOverlay(now = performance.now()) {
 
 function render() {
   ctx.clearRect(0, 0, width, height);
-  const guestMirror = isGuestMirrorMode();
 
   ctx.save();
   if (state.shake > 0) {
@@ -5989,39 +6114,24 @@ function render() {
   const allyCore = getAllyCorePosition();
   if (allyCore) {
     drawCoopCoreLink(ownCore, allyCore);
-    if (guestMirror) {
-      drawAllyCoreLite(allyCore.x, allyCore.y);
-    } else {
-      drawAllyCore(allyCore.x, allyCore.y);
-    }
+    drawAllyCore(allyCore.x, allyCore.y);
   }
 
-  if (guestMirror) {
-    drawCoreLite(ownCore.x, ownCore.y);
-    drawWeapon();
-    drawPlayerHpBar();
-    drawRemoteTracers();
-    drawRemoteBeam();
-    drawBeam();
-    drawZombiesLite();
-    drawAtmosphereOverlay(lastTime);
-  } else {
-    drawCore(ownCore.x, ownCore.y);
-    drawRemoteWeapon();
-    drawWeapon();
-    drawPlayerHpBar();
-    drawRemoteTracers();
-    drawBursts();
-    drawPowerups();
-    drawRemoteBeam();
-    drawBeam();
-    drawParticles();
-    drawZombies();
-    drawBullets();
-    drawFloaters();
-    drawEventOverlay();
-    drawAtmosphereOverlay(lastTime);
-  }
+  drawCore(ownCore.x, ownCore.y);
+  drawRemoteWeapon();
+  drawWeapon();
+  drawPlayerHpBar();
+  drawRemoteTracers();
+  drawBursts();
+  drawPowerups();
+  drawRemoteBeam();
+  drawBeam();
+  drawParticles();
+  drawZombies();
+  drawBullets();
+  drawFloaters();
+  drawEventOverlay();
+  drawAtmosphereOverlay(lastTime);
 
   if (state.pointer.active) {
     drawCrosshair();
