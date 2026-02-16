@@ -1173,6 +1173,19 @@ function coopWsSendRequest(message) {
   coopWs.socket.send(JSON.stringify(message));
 }
 
+async function coopWsSendFast(action, kind, roomId, payload = null) {
+  await ensureCoopWsConnected();
+  const rid = `ff-${Date.now()}-${coopWs.nextRequestId++}`;
+  coopWsSendRequest({
+    type: "request",
+    rid,
+    action,
+    kind,
+    roomId,
+    payload,
+  });
+}
+
 async function coopWsRequest(action, kind, roomId, payload = null, timeoutMs = COOP_WS_REQUEST_TIMEOUT_MS) {
   await ensureCoopWsConnected();
   const rid = `req-${Date.now()}-${coopWs.nextRequestId++}`;
@@ -1610,6 +1623,12 @@ async function flushCoopRoomUpdate(payload) {
 function updateCoopRoom(payload) {
   if (!coopState.active || !coopState.roomId) return;
   if (!payload || typeof payload !== "object") return;
+  if (isCoopWsEnabled()) {
+    coopWsSendFast("update", "room", coopState.roomId, payload).catch((error) => {
+      console.error("Coop WS room fast sync error:", error);
+    });
+    return;
+  }
   if (coopState.roomWriteInFlight) {
     coopState.roomPendingPayload = mergeCoopPayload(coopState.roomPendingPayload, payload);
     return;
@@ -2207,6 +2226,13 @@ function syncCoopWorldState(now) {
     return;
   }
   coopState.lastWorldPayloadKey = snapshotKey;
+
+  if (isCoopWsEnabled()) {
+    coopWsSendFast("set", "world", coopState.roomId, snapshot).catch((error) => {
+      console.error("Coop WS world fast sync error:", error);
+    });
+    return;
+  }
 
   if (coopState.worldWriteInFlight) {
     coopState.worldPendingSnapshot = snapshot;
@@ -4050,10 +4076,10 @@ function getCanvasRenderDpr() {
   const rawDpr = window.devicePixelRatio || 1;
   const isSmallScreen = window.matchMedia("(max-width: 900px)").matches;
   if (isGuestMirrorMode()) {
-    return Math.min(rawDpr, isSmallScreen ? 1.2 : 1.35);
+    return Math.min(rawDpr, isSmallScreen ? 1 : 1.2);
   }
   if (isSmallScreen) {
-    return Math.min(rawDpr, 1.5);
+    return Math.min(rawDpr, 1.2);
   }
   return Math.min(rawDpr, 1.9);
 }
@@ -5058,7 +5084,7 @@ function update(dt, now) {
 
       const netAt = Number(zombie.netAt) || 0;
       const netAge = netAt > 0 ? (performance.now() - netAt) / 1000 : 0;
-      const predictLead = 0;
+      const predictLead = isCoopWsEnabled() ? 0.06 : 0;
       const vx = Number(zombie.vx) || 0;
       const vy = Number(zombie.vy) || 0;
 
@@ -5067,11 +5093,20 @@ function update(dt, now) {
       const targetX = Number.isFinite(netX) ? netX + vx * predictLead : zombie.x;
       const targetY = Number.isFinite(netY) ? netY + vy * predictLead : zombie.y;
 
-      const catchup = netAge > 0.32 ? 0.52 : 0.4;
+      const catchup = isCoopWsEnabled()
+        ? netAge > 0.25
+          ? 0.72
+          : 0.58
+        : netAge > 0.32
+        ? 0.52
+        : 0.4;
       zombie.x += (targetX - zombie.x) * catchup;
       zombie.y += (targetY - zombie.y) * catchup;
 
-      if (netAge > 0.95) {
+      if (netAge > 1.25) {
+        zombie.x = targetX;
+        zombie.y = targetY;
+      } else if (netAge > 0.95) {
         zombie.vx *= 0.65;
         zombie.vy *= 0.65;
       }

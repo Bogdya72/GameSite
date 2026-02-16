@@ -176,6 +176,9 @@ function broadcastSnapshot(kind, roomId) {
 }
 
 function sendResponse(ws, rid, ok, data = null, error = "") {
+  if (String(rid || "").startsWith("ff-")) {
+    return;
+  }
   safeSend(ws, {
     type: "response",
     rid,

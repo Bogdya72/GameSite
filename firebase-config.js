@@ -11,11 +11,6 @@ window.FIREBASE_CONFIG = {
   appId: "1:572319578623:web:268379f5461094db8d4fca",
 };
 
-// URL кооп-WebSocket сервера (для прода укажи wss://...).
-// Локально по умолчанию: ws://localhost:8787
-// Пример:
-// window.COOP_WS_URL = "wss://your-name.onrender.com";
-if (!window.COOP_WS_URL) {
-  const isLocal = /^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname || "");
-  window.COOP_WS_URL = isLocal ? "ws://localhost:8787" : "";
-}
+window.COOP_WS_URL = /^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname || "")
+  ? "ws://localhost:8787"
+  : "wss://zombiesurge-ws.onrender.com";
