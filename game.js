@@ -74,7 +74,7 @@ const COOP_WORLD_MAX_ZOMBIES = 24;
 const COOP_WORLD_MAX_ZOMBIES_WS = 18;
 const COOP_GUEST_FX_STEP_MS = 90;
 const COOP_GUEST_TARGET_FRAME_MS = 16;
-const COOP_WS_REQUEST_TIMEOUT_MS = 5200;
+const COOP_WS_REQUEST_TIMEOUT_MS = 45000;
 const COOP_WS_RECONNECT_BASE_MS = 450;
 const COOP_WS_RECONNECT_MAX_MS = 4200;
 
@@ -948,6 +948,15 @@ function getCoopWsUrl() {
   return "";
 }
 
+function getCoopWsHealthUrl() {
+  const wsUrl = getCoopWsUrl();
+  if (!wsUrl) return "";
+  const httpUrl = wsUrl.replace(/^wss?:\/\//i, (match) =>
+    match.toLowerCase() === "wss://" ? "https://" : "http://"
+  );
+  return httpUrl.endsWith("/") ? `${httpUrl}health` : `${httpUrl}/health`;
+}
+
 function isCoopWsEnabled() {
   return Boolean(getCoopWsUrl());
 }
@@ -970,6 +979,25 @@ function getCoopWorldSyncIntervalMs() {
 
 function getCoopWorldMaxZombies() {
   return isCoopWsEnabled() ? COOP_WORLD_MAX_ZOMBIES_WS : COOP_WORLD_MAX_ZOMBIES;
+}
+
+async function warmupCoopWsServer() {
+  if (!isCoopWsEnabled()) return;
+  const healthUrl = getCoopWsHealthUrl();
+  if (!healthUrl) return;
+  try {
+    await withTimeout(
+      fetch(healthUrl, {
+        method: "GET",
+        cache: "no-store",
+        credentials: "omit",
+      }),
+      22000,
+      "coop-ws-warmup-timeout"
+    );
+  } catch (error) {
+    // Ignore warmup failures; ws connect path will still handle retries/timeouts.
+  }
 }
 
 function makeCoopSnapshot(value) {
@@ -1905,6 +1933,12 @@ async function createCoopLobby() {
     return;
   }
 
+  if (isCoopWsEnabled()) {
+    setCoopBusy(true, "Пробуждаем кооп-сервер...");
+    await warmupCoopWsServer();
+    setCoopBusy(true, "Создаём лобби...");
+  }
+
   const playerName = getCoopDisplayName();
   let roomId = "";
   let created = false;
@@ -1962,7 +1996,7 @@ async function createCoopLobby() {
       code.includes("coop-ws-request-timeout") ||
       code.includes("coop-ws-connect-timeout")
     ) {
-      const urlHint = cloudState.rtdbUrl ? ` RTDB: ${cloudState.rtdbUrl}` : "";
+      const urlHint = !isCoopWsEnabled() && cloudState.rtdbUrl ? ` RTDB: ${cloudState.rtdbUrl}` : "";
       const wsHint = isCoopWsEnabled() ? " WS-сервер недоступен." : "";
       showShopMessage(`Сервер коопа не ответил вовремя.${urlHint}${wsHint}`, "error");
     } else if (code.includes("coop-ws")) {
@@ -2021,6 +2055,12 @@ async function joinCoopLobby() {
   if (!(await ensureCoopSlotForNewLobbyAction())) {
     setCoopBusy(false);
     return;
+  }
+
+  if (isCoopWsEnabled()) {
+    setCoopBusy(true, "Пробуждаем кооп-сервер...");
+    await warmupCoopWsServer();
+    setCoopBusy(true, "Подключаемся к лобби...");
   }
 
   const roomId = normalizeCoopCode(coopCodeInput?.value || "");
@@ -2093,7 +2133,7 @@ async function joinCoopLobby() {
       code.includes("coop-ws-request-timeout") ||
       code.includes("coop-ws-connect-timeout")
     ) {
-      const urlHint = cloudState.rtdbUrl ? ` RTDB: ${cloudState.rtdbUrl}` : "";
+      const urlHint = !isCoopWsEnabled() && cloudState.rtdbUrl ? ` RTDB: ${cloudState.rtdbUrl}` : "";
       const wsHint = isCoopWsEnabled() ? " WS-сервер недоступен." : "";
       showShopMessage(`Сервер коопа не ответил вовремя.${urlHint}${wsHint}`, "error");
     } else if (code.includes("coop-ws")) {
