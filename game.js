@@ -67,10 +67,11 @@ let zombieIdSeed = 1;
 const COOP_SYNC_INTERVAL_MS = 620;
 const COOP_INPUT_SYNC_INTERVAL_MS = 280;
 const COOP_WORLD_SYNC_INTERVAL_MS = 95;
-const COOP_SYNC_INTERVAL_WS_MS = 190;
-const COOP_INPUT_SYNC_INTERVAL_WS_MS = 95;
-const COOP_WORLD_SYNC_INTERVAL_WS_MS = 58;
+const COOP_SYNC_INTERVAL_WS_MS = 130;
+const COOP_INPUT_SYNC_INTERVAL_WS_MS = 75;
+const COOP_WORLD_SYNC_INTERVAL_WS_MS = 82;
 const COOP_WORLD_MAX_ZOMBIES = 24;
+const COOP_WORLD_MAX_ZOMBIES_WS = 18;
 const COOP_GUEST_FX_STEP_MS = 90;
 const COOP_GUEST_TARGET_FRAME_MS = 16;
 const COOP_WS_REQUEST_TIMEOUT_MS = 5200;
@@ -733,7 +734,7 @@ function serializeCoopWorldSnapshot() {
     sh: Math.max(1, Math.round(baseHeight)),
     s: Math.max(0, Number(state.score) || 0),
     w: Math.max(1, Number(state.wave) || 1),
-    z: state.zombies.slice(0, COOP_WORLD_MAX_ZOMBIES).map((zombie) => {
+    z: state.zombies.slice(0, getCoopWorldMaxZombies()).map((zombie) => {
       if (!Number.isFinite(Number(zombie.id)) || Number(zombie.id) <= 0) {
         zombie.id = zombieIdSeed++;
       }
@@ -785,7 +786,7 @@ function applyCoopWorldSnapshot(world) {
   }
 
   const next = [];
-  const worldZombies = zombiesRaw.slice(0, COOP_WORLD_MAX_ZOMBIES);
+  const worldZombies = zombiesRaw.slice(0, getCoopWorldMaxZombies());
   const nowPerf = performance.now();
 
   for (let index = 0; index < worldZombies.length; index += 1) {
@@ -965,6 +966,10 @@ function getCoopSyncIntervalMs(forceInput = false) {
 
 function getCoopWorldSyncIntervalMs() {
   return isCoopWsEnabled() ? COOP_WORLD_SYNC_INTERVAL_WS_MS : COOP_WORLD_SYNC_INTERVAL_MS;
+}
+
+function getCoopWorldMaxZombies() {
+  return isCoopWsEnabled() ? COOP_WORLD_MAX_ZOMBIES_WS : COOP_WORLD_MAX_ZOMBIES;
 }
 
 function makeCoopSnapshot(value) {
@@ -4985,7 +4990,7 @@ function update(dt, now) {
     syncCoopWorldState(now);
   }
 
-  const coopSpawnCap = coopState.active && coopState.roomStatus === "running" ? COOP_WORLD_MAX_ZOMBIES : 999;
+  const coopSpawnCap = coopState.active && coopState.roomStatus === "running" ? getCoopWorldMaxZombies() : 999;
   if (!guestMirror && now - state.lastSpawn > getSpawnInterval() && state.zombies.length < coopSpawnCap) {
     spawnZombie();
     state.lastSpawn = now;
@@ -5084,7 +5089,9 @@ function update(dt, now) {
 
       const netAt = Number(zombie.netAt) || 0;
       const netAge = netAt > 0 ? (performance.now() - netAt) / 1000 : 0;
-      const predictLead = isCoopWsEnabled() ? 0.06 : 0;
+      const predictLead = isCoopWsEnabled()
+        ? clamp(0.02 + netAge * 0.22, 0.02, 0.085)
+        : 0;
       const vx = Number(zombie.vx) || 0;
       const vy = Number(zombie.vy) || 0;
 
@@ -5093,13 +5100,14 @@ function update(dt, now) {
       const targetX = Number.isFinite(netX) ? netX + vx * predictLead : zombie.x;
       const targetY = Number.isFinite(netY) ? netY + vy * predictLead : zombie.y;
 
-      const catchup = isCoopWsEnabled()
-        ? netAge > 0.25
-          ? 0.72
-          : 0.58
+      const responsiveness = isCoopWsEnabled()
+        ? netAge > 0.3
+          ? 20
+          : 14
         : netAge > 0.32
-        ? 0.52
-        : 0.4;
+        ? 13
+        : 10;
+      const catchup = 1 - Math.exp(-responsiveness * dt);
       zombie.x += (targetX - zombie.x) * catchup;
       zombie.y += (targetY - zombie.y) * catchup;
 
