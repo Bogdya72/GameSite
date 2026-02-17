@@ -98,6 +98,21 @@ const BURST_TYPE_TO_CODE = {
 
 const BURST_CODE_TO_TYPE = ["shot", "kill", "blast"];
 
+const POWERUP_TYPE_TO_CODE = {
+  rapid: 0,
+  shield: 1,
+  slow: 2,
+};
+
+const POWERUP_CODE_TO_TYPE = ["rapid", "shield", "slow"];
+
+const EVENT_CODE_TO_TYPE = [null, "fog", "rage", "night"];
+const EVENT_TYPE_TO_CODE = {
+  fog: 1,
+  rage: 2,
+  night: 3,
+};
+
 const coopState = {
   active: false,
   roomId: "",
@@ -138,6 +153,7 @@ const coopState = {
   resultSaved: false,
   lastGuestFxAt: 0,
   lastGuestRenderAt: 0,
+  lastWorldPacketAt: 0,
 };
 
 const coopWs = {
@@ -261,6 +277,8 @@ const WEATHER_CONFIG = {
     storm: false,
   },
 };
+
+const WEATHER_ORDER = ["clear", "rain", "storm", "fog"];
 
 const COLORS = {
   coreGlow: "#2bdc77",
@@ -777,6 +795,28 @@ function serializeCoopWorldSnapshot() {
       const max100 = Math.max(1, Math.round((Number(burst.max) || Number(burst.life) || 0.2) * 100));
       return [xNorm, yNorm, typeCode, life100, max100];
     }),
+    p: state.powerups.slice(0, 20).map((powerup) => {
+      const xNorm = Math.round(clamp((Number(powerup.x) || 0) / baseWidth, 0, 1) * 10000);
+      const yNorm = Math.round(clamp((Number(powerup.y) || 0) / baseHeight, 0, 1) * 10000);
+      const typeCode = POWERUP_TYPE_TO_CODE[String(powerup.type || "rapid")] ?? 0;
+      const life100 = Math.max(0, Math.round((Number(powerup.life) || 0) * 100));
+      return [xNorm, yNorm, typeCode, life100];
+    }),
+    at: [
+      Math.max(0, TIME_OF_DAY_ORDER.indexOf(String(state.atmosphere.timeKey || "dusk"))),
+      Math.max(0, WEATHER_ORDER.indexOf(String(state.atmosphere.weatherKey || "clear"))),
+      Math.max(0, Math.round((Number(state.atmosphere.lightning) || 0) * 100)),
+    ],
+    ev: [
+      EVENT_TYPE_TO_CODE[String(state.event.type || "")] || 0,
+      Math.max(0, Math.round((Number(state.event.timer) || 0) * 100)),
+      Math.max(1, Number(state.event.wave) || Math.max(1, Number(state.wave) || 1)),
+    ],
+    fx: [
+      Math.max(0, Math.round((Number(state.effects.rapid) || 0) * 100)),
+      Math.max(0, Math.round((Number(state.effects.shield) || 0) * 100)),
+      Math.max(0, Math.round((Number(state.effects.slow) || 0) * 100)),
+    ],
   };
 }
 
@@ -789,6 +829,10 @@ function applyCoopWorldSnapshot(world) {
   if (!Array.isArray(zombiesRaw)) return;
   const bulletsRaw = Array.isArray(world.b) ? world.b : Array.isArray(world.bullets) ? world.bullets : null;
   const burstsRaw = Array.isArray(world.u) ? world.u : Array.isArray(world.bursts) ? world.bursts : null;
+  const powerupsRaw = Array.isArray(world.p) ? world.p : Array.isArray(world.powerups) ? world.powerups : null;
+  const atmosphereRaw = Array.isArray(world.at) ? world.at : Array.isArray(world.atmosphere) ? world.atmosphere : null;
+  const eventRaw = Array.isArray(world.ev) ? world.ev : Array.isArray(world.event) ? world.event : null;
+  const effectsRaw = Array.isArray(world.fx) ? world.fx : Array.isArray(world.effects) ? world.effects : null;
 
   coopState.worldVersion = version || Date.now();
   const prevScore = state.score;
@@ -818,6 +862,7 @@ function applyCoopWorldSnapshot(world) {
   const next = [];
   const worldZombies = zombiesRaw.slice(0, getCoopWorldMaxZombies());
   const nowPerf = performance.now();
+  coopState.lastWorldPacketAt = nowPerf;
 
   for (let index = 0; index < worldZombies.length; index += 1) {
     const zombie = worldZombies[index];
@@ -991,6 +1036,63 @@ function applyCoopWorldSnapshot(world) {
       }
     }
     state.bursts = [...nextBursts, ...localVisualBursts].slice(0, COOP_WORLD_MAX_BURSTS + 14);
+  }
+
+  if (Array.isArray(powerupsRaw)) {
+    const nextPowerups = [];
+    const worldPowerups = powerupsRaw.slice(0, 20);
+    for (let index = 0; index < worldPowerups.length; index += 1) {
+      const powerup = worldPowerups[index];
+      if (Array.isArray(powerup)) {
+        const xNorm = clamp((Number(powerup[0]) || 0) / 10000, 0, 1);
+        const yNorm = clamp((Number(powerup[1]) || 0) / 10000, 0, 1);
+        const typeCode = Math.round(Number(powerup[2]) || 0);
+        const life100 = Math.max(0, Number(powerup[3]) || 0);
+        nextPowerups.push({
+          x: xNorm * targetWidth,
+          y: yNorm * targetHeight,
+          type: POWERUP_CODE_TO_TYPE[typeCode] || "rapid",
+          life: life100 / 100,
+        });
+      } else if (powerup && typeof powerup === "object") {
+        nextPowerups.push({
+          x: (Number(powerup.x) || 0) * scaleX,
+          y: (Number(powerup.y) || 0) * scaleY,
+          type: String(powerup.type || "rapid"),
+          life: Math.max(0, Number(powerup.life) || 0),
+        });
+      }
+    }
+    state.powerups = nextPowerups;
+  }
+
+  if (Array.isArray(atmosphereRaw)) {
+    const timeCode = Math.max(0, Math.round(Number(atmosphereRaw[0]) || 0));
+    const weatherCode = Math.max(0, Math.round(Number(atmosphereRaw[1]) || 0));
+    const lightning100 = Math.max(0, Number(atmosphereRaw[2]) || 0);
+    state.atmosphere.timeKey = TIME_OF_DAY_ORDER[timeCode] || state.atmosphere.timeKey || "dusk";
+    state.atmosphere.weatherKey = WEATHER_ORDER[weatherCode] || state.atmosphere.weatherKey || "clear";
+    state.atmosphere.lightning = lightning100 / 100;
+  }
+
+  if (Array.isArray(eventRaw)) {
+    const eventCode = Math.max(0, Math.round(Number(eventRaw[0]) || 0));
+    const eventTimer = Math.max(0, Number(eventRaw[1]) || 0) / 100;
+    const eventWave = Math.max(1, Number(eventRaw[2]) || state.wave || 1);
+    const eventType = EVENT_CODE_TO_TYPE[eventCode] || null;
+    state.event = { type: eventType, timer: eventTimer, wave: eventWave };
+  }
+
+  if (Array.isArray(effectsRaw)) {
+    state.effects = {
+      rapid: Math.max(0, Number(effectsRaw[0]) || 0) / 100,
+      shield: Math.max(0, Number(effectsRaw[1]) || 0) / 100,
+      slow: Math.max(0, Number(effectsRaw[2]) || 0) / 100,
+    };
+  }
+
+  if (isGuestMirrorMode()) {
+    updateStatusLine();
   }
 
   if (prevScore !== state.score || prevWave !== state.wave || !isGuestMirrorMode()) {
@@ -1630,6 +1732,7 @@ function resetCoopLocalState() {
   coopState.resultSaved = false;
   coopState.lastGuestFxAt = 0;
   coopState.lastGuestRenderAt = 0;
+  coopState.lastWorldPacketAt = 0;
   if (playBtn) playBtn.disabled = false;
   closeCoopWsIfIdle();
   resizeCanvas();
@@ -1963,6 +2066,7 @@ function handleCoopSnapshot(roomId, snap) {
   if (wasGuestMirror !== guestMirrorNow) {
     coopState.lastGuestFxAt = 0;
     coopState.lastGuestRenderAt = 0;
+    coopState.lastWorldPacketAt = 0;
     resizeCanvas();
   }
 
@@ -2149,6 +2253,7 @@ async function createCoopLobby() {
   coopState.lastWorldPayloadKey = "";
   coopState.lastGuestFxAt = 0;
   coopState.lastGuestRenderAt = 0;
+  coopState.lastWorldPacketAt = 0;
   setCoopBusy(false);
   subscribeCoopRoom(roomId);
   updateCoopUI();
@@ -2277,6 +2382,7 @@ async function joinCoopLobby() {
   coopState.lastWorldPayloadKey = "";
   coopState.lastGuestFxAt = 0;
   coopState.lastGuestRenderAt = 0;
+  coopState.lastWorldPacketAt = 0;
   setCoopBusy(false);
   subscribeCoopRoom(roomId);
   updateCoopUI();
@@ -2385,6 +2491,12 @@ function syncCoopWorldState(now) {
     (snapshot.u || [])
       .map((burst) => (Array.isArray(burst) ? burst.join(":") : [burst.x, burst.y, burst.type, burst.life, burst.max].join(":")))
       .join(";"),
+    (snapshot.p || [])
+      .map((powerup) => (Array.isArray(powerup) ? powerup.join(":") : [powerup.x, powerup.y, powerup.type, powerup.life].join(":")))
+      .join(";"),
+    (snapshot.at || []).join(":"),
+    (snapshot.ev || []).join(":"),
+    (snapshot.fx || []).join(":"),
   ].join("|");
   if (snapshotKey === coopState.lastWorldPayloadKey) {
     return;
@@ -5124,9 +5236,15 @@ function update(dt, now) {
   const guestMirror = isGuestMirrorMode();
   updateWave();
 
-  updateAtmosphere(dt);
-  updateEffects(dt);
-  updateEvent(dt);
+  const freshWorldAgeMs = now - (Number(coopState.lastWorldPacketAt) || 0);
+  const hasFreshWorldSnapshot = guestMirror && freshWorldAgeMs >= 0 && freshWorldAgeMs < 1200;
+  if (!hasFreshWorldSnapshot) {
+    updateAtmosphere(dt);
+    updateEffects(dt);
+    updateEvent(dt);
+  } else {
+    updateAtmosphereHud();
+  }
   if (guestMirror) {
     coopState.lastGuestFxAt = now;
   }
@@ -5142,8 +5260,6 @@ function update(dt, now) {
   
   if (!guestMirror) {
     updatePowerups(dt);
-  } else if (state.powerups.length > 0) {
-    state.powerups = [];
   }
   state.beamActive = false;
   state.beamTarget = null;
