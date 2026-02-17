@@ -67,11 +67,11 @@ let zombieIdSeed = 1;
 const COOP_SYNC_INTERVAL_MS = 620;
 const COOP_INPUT_SYNC_INTERVAL_MS = 280;
 const COOP_WORLD_SYNC_INTERVAL_MS = 95;
-const COOP_SYNC_INTERVAL_WS_MS = 130;
-const COOP_INPUT_SYNC_INTERVAL_WS_MS = 75;
-const COOP_WORLD_SYNC_INTERVAL_WS_MS = 82;
+const COOP_SYNC_INTERVAL_WS_MS = 95;
+const COOP_INPUT_SYNC_INTERVAL_WS_MS = 45;
+const COOP_WORLD_SYNC_INTERVAL_WS_MS = 58;
 const COOP_WORLD_MAX_ZOMBIES = 24;
-const COOP_WORLD_MAX_ZOMBIES_WS = 18;
+const COOP_WORLD_MAX_ZOMBIES_WS = 24;
 const COOP_WORLD_MAX_BULLETS = 42;
 const COOP_WORLD_MAX_BURSTS = 26;
 const COOP_GUEST_FX_STEP_MS = 16;
@@ -79,6 +79,8 @@ const COOP_GUEST_TARGET_FRAME_MS = 16;
 const COOP_WS_REQUEST_TIMEOUT_MS = 45000;
 const COOP_WS_RECONNECT_BASE_MS = 450;
 const COOP_WS_RECONNECT_MAX_MS = 4200;
+const COOP_REMOTE_SHOT_BURST_PER_TICK = 4;
+const COOP_REMOTE_AIM_ASSIST_RADIUS = 28;
 
 const ZOMBIE_TYPE_TO_CODE = {
   normal: 0,
@@ -130,6 +132,8 @@ const coopState = {
   remoteAimY: 0.5,
   remotePointerDown: false,
   remoteWeapon: "blaster",
+  remoteShotSeq: 0,
+  remoteLastAppliedShotSeq: 0,
   remoteInputAt: 0,
   remoteLastPacketAt: 0,
   remoteMuzzle: 0,
@@ -154,6 +158,7 @@ const coopState = {
   lastGuestFxAt: 0,
   lastGuestRenderAt: 0,
   lastWorldPacketAt: 0,
+  localShotSeq: 0,
 };
 
 const coopWs = {
@@ -380,6 +385,41 @@ function applyHpUpgrades(user) {
   const hpBonus = (hpLevel - 1) * 2;
   const maxHpBonus = (maxHpLevel - 1) * 5;
   return { hpBonus, maxHpBonus };
+}
+
+function getCoreStatsFromProfile(profile = authState?.profile || null) {
+  const { hpBonus, maxHpBonus } = applyHpUpgrades(profile);
+  const maxHp = Math.max(1, 5 + maxHpBonus);
+  const startHp = Math.max(1, maxHp + hpBonus);
+  return { maxHp, startHp };
+}
+
+function syncCoreStatsFromProfile({ heal = false } = {}) {
+  if (coopState.active && coopState.roomStatus === "running") {
+    return getCoreStatsFromProfile(authState?.profile || null);
+  }
+  if (state.status === "running" || state.status === "paused") {
+    return getCoreStatsFromProfile(authState?.profile || null);
+  }
+
+  const coreStats = getCoreStatsFromProfile(authState?.profile || null);
+  state.maxHp = coreStats.maxHp;
+
+  const shouldHeal =
+    heal ||
+    state.status === "idle" ||
+    state.status === "over" ||
+    state.status === "ko" ||
+    !Number.isFinite(Number(state.hp));
+
+  if (shouldHeal) {
+    state.hp = coreStats.startHp;
+  } else {
+    state.hp = clamp(Number(state.hp) || 0, 0, coreStats.startHp);
+  }
+
+  updateHud();
+  return coreStats;
 }
 
 function getStartHealAtLevel(level) {
@@ -703,23 +743,36 @@ function isDualCoreBattleActive() {
   return state.status === "running" || state.status === "ko" || state.status === "over";
 }
 
+function shouldRunHostKoSimulation() {
+  return (
+    coopState.active &&
+    coopState.role === "host" &&
+    coopState.roomStatus === "running" &&
+    state.status === "ko" &&
+    coopState.remoteConnected &&
+    coopState.remoteAlive
+  );
+}
+
 function getOwnCorePosition() {
   if (!isDualCoreBattleActive()) {
     return { x: width / 2, y: height / 2 };
   }
   const offset = Math.min(110, width * 0.11);
+  const ownOnLeft = coopState.role !== "guest";
   return {
-    x: width / 2 - offset,
-    y: height / 2 + 10,
+    x: ownOnLeft ? width / 2 - offset : width / 2 + offset,
+    y: ownOnLeft ? height / 2 + 10 : height / 2 - 10,
   };
 }
 
 function getAllyCorePosition() {
   if (!isDualCoreBattleActive()) return null;
   const offset = Math.min(110, width * 0.11);
+  const ownOnLeft = coopState.role !== "guest";
   return {
-    x: width / 2 + offset,
-    y: height / 2 - 10,
+    x: ownOnLeft ? width / 2 + offset : width / 2 - offset,
+    y: ownOnLeft ? height / 2 - 10 : height / 2 + 10,
   };
 }
 
@@ -748,13 +801,29 @@ function getRemoteAimPoint() {
 }
 
 function isGuestMirrorMode() {
-  return coopState.active && coopState.role === "guest" && coopState.roomStatus === "running";
+  if (!coopState.active || coopState.roomStatus !== "running") return false;
+  if (coopState.role === "guest") return true;
+  return isCoopWsEnabled() && coopState.role === "host";
 }
 
 function serializeCoopWorldSnapshot() {
   const baseWidth = Math.max(1, width || 1);
   const baseHeight = Math.max(1, height || 1);
   const baseMin = Math.max(1, Math.min(baseWidth, baseHeight));
+  const snapshotBullets = state.bullets.slice(-COOP_WORLD_MAX_BULLETS);
+  const recentBursts = state.bursts.slice(-(COOP_WORLD_MAX_BURSTS * 2));
+  const priorityBursts = recentBursts.filter((burst) => burst && burst.type !== "shot");
+  const shotBursts = recentBursts.filter((burst) => burst && burst.type === "shot");
+  const snapshotBursts = [];
+  if (priorityBursts.length >= COOP_WORLD_MAX_BURSTS) {
+    snapshotBursts.push(...priorityBursts.slice(-COOP_WORLD_MAX_BURSTS));
+  } else {
+    snapshotBursts.push(...priorityBursts);
+    const remaining = COOP_WORLD_MAX_BURSTS - snapshotBursts.length;
+    if (remaining > 0) {
+      snapshotBursts.push(...shotBursts.slice(-remaining));
+    }
+  }
 
   return {
     v: Date.now(),
@@ -777,7 +846,7 @@ function serializeCoopWorldSnapshot() {
 
       return [Number(zombie.id), xNorm, yNorm, rNorm, hp10, maxHp10, typeCode, targetCode];
     }),
-    b: state.bullets.slice(0, COOP_WORLD_MAX_BULLETS).map((bullet) => {
+    b: snapshotBullets.map((bullet) => {
       const xNorm = Math.round(clamp((Number(bullet.x) || 0) / baseWidth, 0, 1) * 10000);
       const yNorm = Math.round(clamp((Number(bullet.y) || 0) / baseHeight, 0, 1) * 10000);
       const vxNorm = Math.round(clamp((Number(bullet.vx) || 0) / 2200, -1, 1) * 10000);
@@ -787,7 +856,7 @@ function serializeCoopWorldSnapshot() {
       const life100 = Math.max(0, Math.round((Number(bullet.life) || 0) * 100));
       return [xNorm, yNorm, vxNorm, vyNorm, rNorm, typeCode, life100];
     }),
-    u: state.bursts.slice(0, COOP_WORLD_MAX_BURSTS).map((burst) => {
+    u: snapshotBursts.map((burst) => {
       const xNorm = Math.round(clamp((Number(burst.x) || 0) / baseWidth, 0, 1) * 10000);
       const yNorm = Math.round(clamp((Number(burst.y) || 0) / baseHeight, 0, 1) * 10000);
       const typeCode = BURST_TYPE_TO_CODE[String(burst.type || "shot")] ?? 0;
@@ -862,6 +931,7 @@ function applyCoopWorldSnapshot(world) {
   const next = [];
   const worldZombies = zombiesRaw.slice(0, getCoopWorldMaxZombies());
   const nowPerf = performance.now();
+  const wsMirrorMode = isCoopWsEnabled();
   coopState.lastWorldPacketAt = nowPerf;
 
   for (let index = 0; index < worldZombies.length; index += 1) {
@@ -918,9 +988,15 @@ function applyCoopWorldSnapshot(world) {
         existing.x = incomingX;
         existing.y = incomingY;
       }
-      existing.x += (incomingX - existing.x) * 0.45;
-      existing.y += (incomingY - existing.y) * 0.45;
-      existing.r += (incomingR - existing.r) * 0.45;
+      if (wsMirrorMode) {
+        existing.x = incomingX;
+        existing.y = incomingY;
+        existing.r = incomingR;
+      } else {
+        existing.x += (incomingX - existing.x) * 0.45;
+        existing.y += (incomingY - existing.y) * 0.45;
+        existing.r += (incomingR - existing.r) * 0.45;
+      }
       existing.hp = incomingHp;
       existing.maxHp = incomingMaxHp;
       existing.type = incomingType;
@@ -978,7 +1054,7 @@ function applyCoopWorldSnapshot(world) {
           vx: vxNorm * 2200,
           vy: vyNorm * 2200,
           r: Math.max(2, rNorm * targetMin),
-          life: life100 / 100,
+          life: Math.max(0.08, life100 / 100),
           damage: 0,
           splash: typeCode === 1 ? (WEAPONS.grenade.splash || 70) : 0,
           type: typeCode === 1 ? "grenade" : "bullet",
@@ -991,7 +1067,7 @@ function applyCoopWorldSnapshot(world) {
           vx: Number(bullet.vx) || 0,
           vy: Number(bullet.vy) || 0,
           r: Math.max(2, (Number(bullet.r) || 3) * radiusScale),
-          life: Math.max(0, Number(bullet.life) || 0.4),
+          life: Math.max(0.08, Number(bullet.life) || 0.4),
           damage: 0,
           splash: Number(bullet.splash) || 0,
           type: String(bullet.type || "bullet"),
@@ -1711,6 +1787,8 @@ function resetCoopLocalState() {
   coopState.remoteAimY = 0.5;
   coopState.remotePointerDown = false;
   coopState.remoteWeapon = "blaster";
+  coopState.remoteShotSeq = 0;
+  coopState.remoteLastAppliedShotSeq = 0;
   coopState.remoteInputAt = 0;
   coopState.remoteLastPacketAt = 0;
   coopState.remoteMuzzle = 0;
@@ -1733,6 +1811,7 @@ function resetCoopLocalState() {
   coopState.lastGuestFxAt = 0;
   coopState.lastGuestRenderAt = 0;
   coopState.lastWorldPacketAt = 0;
+  coopState.localShotSeq = 0;
   if (playBtn) playBtn.disabled = false;
   closeCoopWsIfIdle();
   resizeCanvas();
@@ -1941,13 +2020,18 @@ function handleLocalCoreDestroyed() {
   if (state.status === "ko" || state.status === "over") return;
 
   state.hp = 0;
-  state.running = false;
   state.status = "ko";
   state.pointer.down = false;
   state.beamActive = false;
   updateHud();
 
   const teammateAlive = coopState.remoteConnected && coopState.remoteAlive;
+  const keepHostSimulationAlive =
+    coopState.active &&
+    coopState.role === "host" &&
+    coopState.roomStatus === "running" &&
+    teammateAlive;
+  state.running = keepHostSimulationAlive;
   if (teammateAlive) {
     showOverlay("Твоё ядро уничтожено", "Союзник ещё в бою. Ждём завершение матча.", "Ожидание...");
     playBtn.disabled = true;
@@ -1966,6 +2050,55 @@ function handleLocalCoreDestroyed() {
     }
     handleCoopMatchEnded("Оба ядра уничтожены.");
   }
+}
+
+function fallbackGuestFromCoop(reason = "Связь с кооп-сервером потеряна. Игра продолжена в соло.") {
+  if (!coopState.active || coopState.roomStatus !== "running") return;
+
+  const shouldContinue = state.status === "running" && state.hp > 0;
+  const safeWave = Math.max(1, Number(state.wave) || 1);
+
+  for (let i = 0; i < state.zombies.length; i += 1) {
+    const zombie = state.zombies[i];
+    zombie.baseSpeed = Math.max(
+      12,
+      Number(zombie.baseSpeed) || estimateZombieBaseSpeed(zombie.type || "normal", safeWave)
+    );
+    zombie.dashCooldown =
+      Number(zombie.dashCooldown) ||
+      (zombie.type === "dash" ? 1 + Math.random() * 1.2 : 0);
+    zombie.dashTimer = Number(zombie.dashTimer) || 0;
+    zombie.targetCore = "own";
+  }
+
+  resetCoopLocalState();
+
+  if (shouldContinue) {
+    state.running = true;
+    state.status = "running";
+    state.pointer.down = false;
+    state.beamActive = false;
+    hideOverlay();
+    playBtn.disabled = false;
+    updatePauseButton();
+    updateStatusLine();
+    updateHud();
+    updateMusicMix();
+    showShopMessage(reason, "error");
+    return;
+  }
+
+  state.running = false;
+  state.status = "over";
+  state.pointer.down = false;
+  state.beamActive = false;
+  showOverlay("Связь потеряна", reason, "Играть");
+  playBtn.disabled = false;
+  updatePauseButton();
+  updateStatusLine();
+  updateHud();
+  updateMusicMix();
+  showShopMessage(reason, "error");
 }
 
 function handleCoopSnapshot(roomId, snap) {
@@ -2001,11 +2134,29 @@ function handleCoopSnapshot(roomId, snap) {
   const remoteSlot = role === "host" ? guest : host;
   coopState.remoteConnected = Boolean(remoteSlot && remoteSlot.uid);
   coopState.remoteName = remoteSlot?.name || "";
-  coopState.remoteHp = Math.max(0, Number(remoteSlot?.hp || 0));
-  coopState.remoteMaxHp = Math.max(1, Number(remoteSlot?.maxHp || 5));
-  coopState.remoteAlive = Boolean(remoteSlot && remoteSlot.alive !== false && coopState.remoteHp > 0);
+  const remoteHpRaw = Number(remoteSlot?.hp);
+  const remoteMaxHpRaw = Number(remoteSlot?.maxHp);
+  coopState.remoteHp = Number.isFinite(remoteHpRaw) ? Math.max(0, remoteHpRaw) : 0;
+  coopState.remoteMaxHp = Number.isFinite(remoteMaxHpRaw) ? Math.max(1, remoteMaxHpRaw) : 5;
+  coopState.remoteAlive = Boolean(
+    remoteSlot &&
+      (remoteSlot.alive === undefined || remoteSlot.alive !== false) &&
+      coopState.remoteHp > 0
+  );
   coopState.remoteWave = Math.max(1, Number(remoteSlot?.wave || 1));
   coopState.remoteScore = Math.max(0, Number(remoteSlot?.score || 0));
+  if (!coopState.remoteConnected) {
+    coopState.remoteShotSeq = 0;
+    coopState.remoteLastAppliedShotSeq = 0;
+  }
+  const remoteShotSeqRaw = Number(remoteSlot?.shotSeq);
+  if (Number.isFinite(remoteShotSeqRaw)) {
+    const normalizedShotSeq = Math.max(0, Math.floor(remoteShotSeqRaw));
+    if (normalizedShotSeq < coopState.remoteLastAppliedShotSeq) {
+      coopState.remoteLastAppliedShotSeq = normalizedShotSeq;
+    }
+    coopState.remoteShotSeq = normalizedShotSeq;
+  }
   if (remoteSlot && Number.isFinite(Number(remoteSlot.aimX))) {
     coopState.remoteAimX = clamp(Number(remoteSlot.aimX), 0, 1);
   }
@@ -2027,9 +2178,24 @@ function handleCoopSnapshot(roomId, snap) {
     coopState.roomStatus === "running";
 
   const ownSlot = role === "host" ? host : guest;
-  if (ownSlot && role === "guest" && coopState.roomStatus === "running") {
-    state.maxHp = Math.max(1, Number(ownSlot.maxHp || state.maxHp));
-    state.hp = Math.max(0, Number(ownSlot.hp || state.hp));
+  const profileCoreStats = getCoreStatsFromProfile(authState.profile);
+  if (
+    ownSlot &&
+    coopState.roomStatus === "running" &&
+    (role === "guest" || isCoopWsEnabled())
+  ) {
+    const ownSlotMaxHpRaw = Number(ownSlot.maxHp);
+    const ownSlotHpRaw = Number(ownSlot.hp);
+    const resolvedMaxHp = Number.isFinite(ownSlotMaxHpRaw)
+      ? Math.max(profileCoreStats.maxHp, Math.max(1, ownSlotMaxHpRaw))
+      : Math.max(profileCoreStats.maxHp, Math.max(1, Number(state.maxHp) || 1));
+    state.maxHp = resolvedMaxHp;
+    if (Number.isFinite(ownSlotHpRaw)) {
+      const hpCap = Math.max(profileCoreStats.startHp, resolvedMaxHp);
+      state.hp = clamp(ownSlotHpRaw, 0, hpCap);
+    } else {
+      state.hp = clamp(Number(state.hp) || 0, 0, Math.max(profileCoreStats.startHp, resolvedMaxHp));
+    }
     if (state.hp <= 0 && state.status === "running") {
       handleLocalCoreDestroyed();
     } else {
@@ -2075,7 +2241,8 @@ function handleCoopSnapshot(roomId, snap) {
 
 function handleCoopWorldSnapshot(roomId, snap) {
   if (!coopState.active || coopState.roomId !== roomId) return;
-  if (coopState.role !== "guest" || coopState.roomStatus !== "running") return;
+  if (coopState.roomStatus !== "running") return;
+  if (coopState.role !== "guest" && !(isCoopWsEnabled() && coopState.role === "host")) return;
   if (!snap.exists()) return;
   const world = snap.val() || null;
   applyCoopWorldSnapshot(world);
@@ -2100,7 +2267,7 @@ function subscribeCoopRoom(roomId) {
     roomRef.off("value", onValue);
   };
 
-  if (coopState.role === "guest") {
+  if (coopState.role === "guest" || (isCoopWsEnabled() && coopState.role === "host")) {
     const worldRef = getCoopWorldRef(roomId);
     if (worldRef) {
       const onWorldValue = (snap) => {
@@ -2156,6 +2323,13 @@ async function createCoopLobby() {
     setCoopBusy(true, "Создаём лобби...");
   }
 
+  const lobbyCoreStats = getCoreStatsFromProfile(authState.profile);
+  if (state.status !== "running" && state.status !== "paused") {
+    state.maxHp = lobbyCoreStats.maxHp;
+    state.hp = lobbyCoreStats.startHp;
+    updateHud();
+  }
+
   const playerName = getCoopDisplayName();
   let roomId = "";
   let created = false;
@@ -2184,15 +2358,16 @@ async function createCoopLobby() {
           host: {
             uid: authState.user.uid,
             name: playerName,
-            hp: Math.max(0, state.hp),
-            maxHp: Math.max(1, state.maxHp),
-            alive: true,
+            hp: lobbyCoreStats.startHp,
+            maxHp: lobbyCoreStats.maxHp,
+            alive: lobbyCoreStats.startHp > 0,
             score: 0,
             wave: 1,
             aimX: getPointerNorm().x,
             aimY: getPointerNorm().y,
             pointerDown: false,
             weapon: "blaster",
+            shotSeq: 0,
             inputAt: Date.now(),
             updatedAt: Date.now(),
           },
@@ -2288,6 +2463,13 @@ async function joinCoopLobby() {
     return;
   }
 
+  const lobbyCoreStats = getCoreStatsFromProfile(authState.profile);
+  if (state.status !== "running" && state.status !== "paused") {
+    state.maxHp = lobbyCoreStats.maxHp;
+    state.hp = lobbyCoreStats.startHp;
+    updateHud();
+  }
+
   const playerName = getCoopDisplayName();
 
   try {
@@ -2325,15 +2507,16 @@ async function joinCoopLobby() {
         guest: {
           uid: authState.user.uid,
           name: playerName,
-          hp: Math.max(0, state.hp),
-          maxHp: Math.max(1, state.maxHp),
-          alive: true,
+          hp: lobbyCoreStats.startHp,
+          maxHp: lobbyCoreStats.maxHp,
+          alive: lobbyCoreStats.startHp > 0,
           score: 0,
           wave: 1,
           aimX: getPointerNorm().x,
           aimY: getPointerNorm().y,
           pointerDown: false,
           weapon: "blaster",
+          shotSeq: 0,
           inputAt: Date.now(),
           updatedAt: Date.now(),
         },
@@ -2472,7 +2655,9 @@ async function flushCoopWorldSync(snapshot) {
 
 function syncCoopWorldState(now) {
   if (!coopState.active || coopState.role !== "host" || !coopState.roomId) return;
-  if (!isCoopBackendReady() || state.status !== "running" || !coopState.remoteConnected) return;
+  if (isCoopWsEnabled()) return;
+  const canStreamWorld = state.status === "running" || shouldRunHostKoSimulation();
+  if (!isCoopBackendReady() || !canStreamWorld || !coopState.remoteConnected) return;
   if (now - coopState.lastWorldSyncAt < getCoopWorldSyncIntervalMs()) return;
 
   coopState.lastWorldSyncAt = now;
@@ -2534,8 +2719,9 @@ function syncCoopState(now, force = false) {
   const ownMaxHp = Math.max(1, state.maxHp);
   const ownScore = Math.max(0, state.score);
   const ownWave = Math.max(1, state.wave);
+  const ownShotSeq = Math.max(0, Math.floor(coopState.localShotSeq || 0));
 
-  const payload = {
+  let payload = {
     updatedAt: makeServerTimestamp(),
     [`${role}/name`]: getCoopDisplayName(),
     [`${role}/hp`]: ownHp,
@@ -2547,52 +2733,82 @@ function syncCoopState(now, force = false) {
     [`${role}/aimY`]: aimY,
     [`${role}/pointerDown`]: pointerDown,
     [`${role}/weapon`]: WEAPONS[state.weapon] ? state.weapon : "blaster",
+    [`${role}/shotSeq`]: ownShotSeq,
     [`${role}/inputAt`]: Date.now(),
     [`${role}/updatedAt`]: Date.now(),
   };
 
-  if (isGuestMirrorMode()) {
-    delete payload[`${role}/hp`];
-    delete payload[`${role}/maxHp`];
-    delete payload[`${role}/alive`];
-    delete payload[`${role}/score`];
-    delete payload[`${role}/wave`];
-  }
+  if (isCoopWsEnabled()) {
+    payload = {
+      updatedAt: makeServerTimestamp(),
+      [`${role}/name`]: getCoopDisplayName(),
+      [`${role}/maxHp`]: ownMaxHp,
+      [`${role}/aimX`]: aimX,
+      [`${role}/aimY`]: aimY,
+      [`${role}/pointerDown`]: pointerDown,
+      [`${role}/weapon`]: WEAPONS[state.weapon] ? state.weapon : "blaster",
+      [`${role}/shotSeq`]: ownShotSeq,
+      [`${role}/inputAt`]: Date.now(),
+      [`${role}/updatedAt`]: Date.now(),
+    };
+    if (state.status === "running" && role === "host") {
+      payload.status = "running";
+      payload.endedReason = "";
+    }
+  } else {
+    if (isGuestMirrorMode()) {
+      delete payload[`${role}/hp`];
+      delete payload[`${role}/alive`];
+      delete payload[`${role}/score`];
+      delete payload[`${role}/wave`];
+    }
 
-  if (role === "host") {
-    payload.sharedWave = ownWave;
-    if (coopState.remoteConnected) {
-      payload["guest/hp"] = Math.max(0, Number(coopState.remoteHp) || 0);
-      payload["guest/maxHp"] = Math.max(1, Number(coopState.remoteMaxHp) || 5);
-      payload["guest/alive"] = payload["guest/hp"] > 0;
-      payload["guest/wave"] = ownWave;
-      payload["guest/score"] = ownScore;
+    if (role === "host") {
+      payload.sharedWave = ownWave;
+      if (coopState.remoteConnected && coopState.roomStatus === "running") {
+        payload["guest/hp"] = Math.max(0, Number(coopState.remoteHp) || 0);
+        payload["guest/maxHp"] = Math.max(1, Number(coopState.remoteMaxHp) || 5);
+        payload["guest/alive"] = payload["guest/hp"] > 0;
+      }
+    }
+
+    if (state.status === "running") {
+      payload.status = "running";
+      payload.endedReason = "";
     }
   }
 
-  if (state.status === "running") {
-    payload.status = "running";
-    payload.endedReason = "";
-  }
-
-  const payloadKeyParts = [
-    role,
-    alive ? 1 : 0,
-    ownHp,
-    ownMaxHp,
-    ownScore,
-    ownWave,
-    aimX,
-    aimY,
-    pointerDown ? 1 : 0,
-    payload[`${role}/weapon`],
-    state.status,
-    payload.status || "",
-    payload.sharedWave || "",
-    payload["guest/hp"] ?? "",
-    payload["guest/maxHp"] ?? "",
-    payload["guest/alive"] ?? "",
-  ];
+  const payloadKeyParts = isCoopWsEnabled()
+    ? [
+        role,
+        ownMaxHp,
+        aimX,
+        aimY,
+        pointerDown ? 1 : 0,
+        payload[`${role}/weapon`],
+        ownShotSeq,
+        state.status,
+        payload.status || "",
+      ]
+    : [
+        role,
+        alive ? 1 : 0,
+        ownHp,
+        ownMaxHp,
+        ownScore,
+        ownWave,
+        aimX,
+        aimY,
+        pointerDown ? 1 : 0,
+        payload[`${role}/weapon`],
+        ownShotSeq,
+        state.status,
+        payload.status || "",
+        payload.sharedWave || "",
+        payload["guest/hp"] ?? "",
+        payload["guest/maxHp"] ?? "",
+        payload["guest/alive"] ?? "",
+      ];
   const payloadKey = payloadKeyParts.join("|");
   if (payloadKey === coopState.lastRoomPayloadKey) {
     coopState.lastSyncAt = now;
@@ -3192,6 +3408,7 @@ async function signOut() {
   authState.profile = null;
   authState.sessionStart = null;
   resetCoopLocalState();
+  syncCoreStatsFromProfile({ heal: true });
   updateAuthUI();
   updateLeaderboard();
 }
@@ -3236,6 +3453,7 @@ async function checkAuth() {
     authState.user = null;
     authState.profile = null;
     authState.sessionStart = null;
+    syncCoreStatsFromProfile({ heal: true });
     updateAuthUI();
     updateLeaderboard();
     return;
@@ -3252,6 +3470,7 @@ async function checkAuth() {
       authState.loading = false;
       localStorage.removeItem(STORAGE_KEYS.CURRENT_USER);
       resetCoopLocalState();
+      syncCoreStatsFromProfile({ heal: true });
       updateAuthUI();
       updateLeaderboard();
       return;
@@ -3264,6 +3483,7 @@ async function checkAuth() {
       authState.loading = false;
       localStorage.removeItem(STORAGE_KEYS.CURRENT_USER);
       resetCoopLocalState();
+      syncCoreStatsFromProfile({ heal: true });
       updateAuthUI();
       updateLeaderboard();
       return;
@@ -3298,6 +3518,7 @@ async function checkAuth() {
     users[email] = authState.profile;
     saveUsersLocalOnly(users);
     await queueCloudProfileSave(authState.profile);
+    syncCoreStatsFromProfile({ heal: true });
 
     authState.loading = false;
     updateAuthUI();
@@ -3446,6 +3667,9 @@ function upgradeStat(type) {
   users[email][type] = currentLevel + 1;
   saveUsers(users);
   authState.profile = users[email];
+  if (type === "hpLevel" || type === "maxHpLevel") {
+    syncCoreStatsFromProfile({ heal: true });
+  }
   updateAuthUI();
   showShopMessage("Прокачка выполнена!", "success");
   return true;
@@ -4372,19 +4596,15 @@ function resizeCanvas() {
 
 function resetGame() {
   zombieIdSeed = 1;
-  // Применить прокачку если игрок авторизован
-  let hpBonus = 0;
-  let maxHpBonus = 0;
-  if (authState.profile) {
-    const bonuses = applyHpUpgrades(authState.profile);
-    hpBonus = bonuses.hpBonus;
-    maxHpBonus = bonuses.maxHpBonus;
-  }
+  coopState.localShotSeq = 0;
+  coopState.remoteShotSeq = 0;
+  coopState.remoteLastAppliedShotSeq = 0;
+  const coreStats = getCoreStatsFromProfile(authState.profile);
   
   state.score = 0;
   state.wave = 1;
-  state.maxHp = 5 + maxHpBonus;
-  state.hp = state.maxHp + hpBonus; // Лечение при старте
+  state.maxHp = coreStats.maxHp;
+  state.hp = coreStats.startHp;
   state.combo = 0;
   state.lastKill = 0;
   state.lastShot = 0;
@@ -4511,7 +4731,7 @@ function updatePauseButton() {
   }
 
   pauseBtn.textContent = "⏸ Пауза";
-  pauseBtn.disabled = state.status === "idle" || state.status === "over";
+  pauseBtn.disabled = state.status === "idle" || state.status === "over" || state.status === "ko";
 }
 
 function updateSoundButton() {
@@ -4700,6 +4920,16 @@ function pickZombieType() {
   return "dash";
 }
 
+function estimateZombieBaseSpeed(type = "normal", wave = state.wave) {
+  const safeWave = Math.max(1, Number(wave) || 1);
+  const base = 38 + safeWave * 6;
+  if (type === "fast") return base * 1.6;
+  if (type === "tank") return base * 0.65;
+  if (type === "dash") return base * 1.15;
+  if (type === "boss") return base * 0.55;
+  return base + 7;
+}
+
 function createZombie(type, x, y) {
   const baseSpeed = 38 + state.wave * 6;
   let speed = baseSpeed + Math.random() * 14;
@@ -4775,22 +5005,28 @@ function getShotCooldown() {
 }
 
 function spawnBullet({ x, y, vx, vy, life, r, damage, type = "bullet", splash = 0 }) {
+  const guestMirror = isGuestMirrorMode();
   // Применить бонус урона
-  if (authState.profile && authState.profile.weapons && authState.profile.weapons[state.weapon]) {
+  if (!guestMirror && authState.profile && authState.profile.weapons && authState.profile.weapons[state.weapon]) {
     const damageBonus = getWeaponDamageBonus(authState.profile, state.weapon);
     damage = damage * (1 + damageBonus);
   }
+  const visualLife = guestMirror
+    ? type === "grenade"
+      ? Math.min(Number(life) || 0.55, 0.55)
+      : Math.min(Number(life) || 0.28, 0.28)
+    : life;
   state.bullets.push({
     x,
     y,
     vx,
     vy,
-    life,
+    life: visualLife,
     r,
     damage,
     type,
     splash,
-    origin: isGuestMirrorMode() ? "local" : "host",
+    origin: guestMirror ? "local" : "host",
   });
 }
 
@@ -4804,7 +5040,7 @@ function getAccuracyJitter(baseSpread = 0.04) {
 }
 
 function shoot(targetX, targetY, now) {
-  if (!state.running) {
+  if (!state.running || state.status !== "running") {
     return;
   }
 
@@ -4888,6 +5124,10 @@ function shoot(targetX, targetY, now) {
     type: "shot",
     origin: isGuestMirrorMode() ? "local" : "host",
   });
+  if (isGuestMirrorMode() && coopState.active && coopState.roomStatus === "running") {
+    coopState.localShotSeq = Math.max(0, Math.floor(coopState.localShotSeq || 0)) + 1;
+    syncCoopState(performance.now(), true);
+  }
   playShotSound();
 }
 
@@ -5020,6 +5260,10 @@ function updatePowerups(dt) {
 }
 
 function fireBeam(dt, now) {
+  if (!state.running || state.status !== "running") {
+    state.beamActive = false;
+    return;
+  }
   state.beamActive = true;
   const ownCore = getOwnCorePosition();
   const originX = ownCore.x;
@@ -5064,7 +5308,17 @@ function fireBeam(dt, now) {
   }
 }
 
-function applyRemoteRayDamage(originX, originY, targetX, targetY, damage, now, thickness = 10, limitHits = 1) {
+function applyRemoteRayDamage(
+  originX,
+  originY,
+  targetX,
+  targetY,
+  damage,
+  now,
+  thickness = 10,
+  limitHits = 1,
+  assistRadius = 0
+) {
   const dx = targetX - originX;
   const dy = targetY - originY;
   const rayLength = Math.hypot(dx, dy) || 1;
@@ -5092,10 +5346,48 @@ function applyRemoteRayDamage(originX, originY, targetX, targetY, damage, now, t
       break;
     }
   }
+
+  if (hits <= 0 && assistRadius > 0 && limitHits > 0) {
+    let bestIndex = -1;
+    let bestScore = Infinity;
+    for (let i = state.zombies.length - 1; i >= 0; i -= 1) {
+      const zombie = state.zombies[i];
+      const zx = zombie.x - originX;
+      const zy = zombie.y - originY;
+      const projection = zx * nx + zy * ny;
+      if (projection < -zombie.r || projection > rayLength + Math.max(48, zombie.r * 2.2)) {
+        continue;
+      }
+      const perpendicular = Math.abs(zx * ny - zy * nx);
+      const endpointDist = Math.hypot(zombie.x - targetX, zombie.y - targetY);
+      const effectiveRadius = zombie.r + assistRadius;
+      if (perpendicular > effectiveRadius && endpointDist > effectiveRadius * 1.4) {
+        continue;
+      }
+      const score = perpendicular * 0.66 + endpointDist * 0.34;
+      if (score < bestScore) {
+        bestScore = score;
+        bestIndex = i;
+      }
+    }
+
+    if (bestIndex >= 0) {
+      const zombie = state.zombies[bestIndex];
+      if (zombie) {
+        if (applyDamage(zombie, damage, now, 3)) {
+          state.zombies.splice(bestIndex, 1);
+        }
+        hits = 1;
+      }
+    }
+  }
+
+  return hits;
 }
 
 function applyRemoteSupportFire(dt, now) {
-  if (!isDualCoreBattleActive() || !coopState.remoteConnected || !coopState.remoteAlive || state.status !== "running") {
+  const canSimulateRemoteFire = state.status === "running" || shouldRunHostKoSimulation();
+  if (!isDualCoreBattleActive() || !coopState.remoteConnected || !coopState.remoteAlive || !canSimulateRemoteFire) {
     coopState.remoteBeamActive = false;
     coopState.remoteBeamTarget = null;
     return;
@@ -5104,23 +5396,24 @@ function applyRemoteSupportFire(dt, now) {
   if (coopState.remoteLastPacketAt <= 0 || performance.now() - coopState.remoteLastPacketAt > 2200) {
     coopState.remotePointerDown = false;
   }
-  if (!coopState.remotePointerDown) {
-    coopState.remoteBeamActive = false;
-    coopState.remoteBeamTarget = null;
-    return;
-  }
 
   const allyCore = getAllyCorePosition();
   if (!allyCore) return;
   const target = getRemoteAimPoint();
   const weaponKey = WEAPONS[coopState.remoteWeapon] ? coopState.remoteWeapon : "blaster";
-  const canApplyDamage = coopState.role === "host";
+  const canApplyDamage = coopState.role === "host" && !isCoopWsEnabled();
+  const pointerFiring = Boolean(coopState.remotePointerDown);
 
   if (weaponKey === "beam") {
+    if (!pointerFiring) {
+      coopState.remoteBeamActive = false;
+      coopState.remoteBeamTarget = null;
+      return;
+    }
     coopState.remoteBeamActive = true;
     coopState.remoteBeamTarget = { x: target.x, y: target.y };
     if (canApplyDamage) {
-      const beamDps = WEAPONS.beam.dps * 0.72;
+      const beamDps = WEAPONS.beam.dps;
       applyRemoteRayDamage(
         allyCore.x,
         allyCore.y,
@@ -5129,7 +5422,8 @@ function applyRemoteSupportFire(dt, now) {
         beamDps * dt,
         now,
         WEAPONS.beam.width * 0.55,
-        3
+        3,
+        0
       );
     }
     return;
@@ -5137,80 +5431,124 @@ function applyRemoteSupportFire(dt, now) {
 
   coopState.remoteBeamActive = false;
   coopState.remoteBeamTarget = null;
+  const remoteShotSeq = Math.max(0, Math.floor(Number(coopState.remoteShotSeq) || 0));
+  const remoteAppliedSeq = Math.max(0, Math.floor(Number(coopState.remoteLastAppliedShotSeq) || 0));
+  let queuedShots = Math.max(0, remoteShotSeq - remoteAppliedSeq);
+
   coopState.remoteShotTimer = Math.max(0, coopState.remoteShotTimer - dt);
-  if (coopState.remoteShotTimer > 0) return;
+  if (queuedShots <= 0) return;
 
   const cooldown = Math.max(0.12, (WEAPONS[weaponKey].cooldown || 240) / 1000);
-  coopState.remoteShotTimer = cooldown;
-  coopState.remoteMuzzle = 1;
+  let shotsToProcess = 0;
+  if (coopState.remoteShotTimer <= 0) {
+    shotsToProcess = 1;
+    coopState.remoteShotTimer = cooldown;
+  }
 
-  if (weaponKey === "grenade") {
-    const gx = allyCore.x + (target.x - allyCore.x) * 0.68;
-    const gy = allyCore.y + (target.y - allyCore.y) * 0.68;
-    pushRemoteTracer({
-      x1: allyCore.x,
-      y1: allyCore.y,
-      x2: gx,
-      y2: gy,
-      life: 0.14,
-      max: 0.14,
-      width: 3.4,
-      color: "rgba(174, 228, 255, 0.86)",
-    });
-    const radius = (WEAPONS.grenade.splash || 70) * 0.9;
-    const grenadeDamage = WEAPONS.grenade.damage * 0.72;
-    state.bursts.push({ x: gx, y: gy, life: 0.42, max: 0.42, type: "blast" });
-    if (canApplyDamage) {
-      for (let i = state.zombies.length - 1; i >= 0; i -= 1) {
-        const zombie = state.zombies[i];
-        if (Math.hypot(zombie.x - gx, zombie.y - gy) < radius + zombie.r) {
-          if (applyDamage(zombie, grenadeDamage, now, 8)) {
-            state.zombies.splice(i, 1);
-          }
-        }
-      }
-    }
+  if (queuedShots > shotsToProcess) {
+    shotsToProcess = Math.min(queuedShots, COOP_REMOTE_SHOT_BURST_PER_TICK);
+    coopState.remoteShotTimer = Math.min(coopState.remoteShotTimer, cooldown * 0.45);
+  }
+
+  if (shotsToProcess <= 0) {
     return;
   }
 
-  if (weaponKey === "shotgun") {
-    const baseAngle = Math.atan2(target.y - allyCore.y, target.x - allyCore.x);
-    const rayLength = Math.max(150, Math.hypot(target.x - allyCore.x, target.y - allyCore.y));
-    for (let p = 0; p < 4; p += 1) {
-      const spread = (Math.random() - 0.5) * 0.26;
-      const angle = baseAngle + spread;
-      const shotX = allyCore.x + Math.cos(angle) * rayLength;
-      const shotY = allyCore.y + Math.sin(angle) * rayLength;
+  shotsToProcess = Math.min(shotsToProcess, queuedShots);
+  coopState.remoteMuzzle = 1;
+
+  for (let shotIndex = 0; shotIndex < shotsToProcess; shotIndex += 1) {
+    if (weaponKey === "grenade") {
+      const gx = allyCore.x + (target.x - allyCore.x) * 0.68;
+      const gy = allyCore.y + (target.y - allyCore.y) * 0.68;
       pushRemoteTracer({
         x1: allyCore.x,
         y1: allyCore.y,
-        x2: shotX,
-        y2: shotY,
-        life: 0.1,
-        max: 0.1,
-        width: 2.2,
-        color: "rgba(157, 224, 255, 0.78)",
+        x2: gx,
+        y2: gy,
+        life: 0.14,
+        max: 0.14,
+        width: 3.4,
+        color: "rgba(174, 228, 255, 0.86)",
       });
+      const radius = WEAPONS.grenade.splash || 70;
+      const grenadeDamage = WEAPONS.grenade.damage;
+      state.bursts.push({ x: gx, y: gy, life: 0.42, max: 0.42, type: "blast" });
       if (canApplyDamage) {
-        applyRemoteRayDamage(allyCore.x, allyCore.y, shotX, shotY, WEAPONS.shotgun.damage * 0.74, now, 14, 1);
+        for (let i = state.zombies.length - 1; i >= 0; i -= 1) {
+          const zombie = state.zombies[i];
+          if (Math.hypot(zombie.x - gx, zombie.y - gy) < radius + zombie.r) {
+            if (applyDamage(zombie, grenadeDamage, now, 8)) {
+              state.zombies.splice(i, 1);
+            }
+          }
+        }
       }
+      continue;
     }
-    return;
+
+    if (weaponKey === "shotgun") {
+      const baseAngle = Math.atan2(target.y - allyCore.y, target.x - allyCore.x);
+      const rayLength = Math.max(150, Math.hypot(target.x - allyCore.x, target.y - allyCore.y));
+      for (let p = 0; p < 4; p += 1) {
+        const spread = (Math.random() - 0.5) * 0.26;
+        const angle = baseAngle + spread;
+        const shotX = allyCore.x + Math.cos(angle) * rayLength;
+        const shotY = allyCore.y + Math.sin(angle) * rayLength;
+        pushRemoteTracer({
+          x1: allyCore.x,
+          y1: allyCore.y,
+          x2: shotX,
+          y2: shotY,
+          life: 0.1,
+          max: 0.1,
+          width: 2.2,
+          color: "rgba(157, 224, 255, 0.78)",
+        });
+        if (canApplyDamage) {
+          applyRemoteRayDamage(
+            allyCore.x,
+            allyCore.y,
+            shotX,
+            shotY,
+            WEAPONS.shotgun.damage,
+            now,
+            14,
+            1,
+            COOP_REMOTE_AIM_ASSIST_RADIUS * 0.8
+          );
+        }
+      }
+      continue;
+    }
+
+    pushRemoteTracer({
+      x1: allyCore.x,
+      y1: allyCore.y,
+      x2: target.x,
+      y2: target.y,
+      life: 0.11,
+      max: 0.11,
+      width: 2.4,
+      color: "rgba(152, 223, 255, 0.86)",
+    });
+    if (canApplyDamage) {
+      applyRemoteRayDamage(
+        allyCore.x,
+        allyCore.y,
+        target.x,
+        target.y,
+        WEAPONS.blaster.damage,
+        now,
+        10,
+        1,
+        COOP_REMOTE_AIM_ASSIST_RADIUS
+      );
+    }
   }
 
-  pushRemoteTracer({
-    x1: allyCore.x,
-    y1: allyCore.y,
-    x2: target.x,
-    y2: target.y,
-    life: 0.11,
-    max: 0.11,
-    width: 2.4,
-    color: "rgba(152, 223, 255, 0.86)",
-  });
-  if (canApplyDamage) {
-    applyRemoteRayDamage(allyCore.x, allyCore.y, target.x, target.y, WEAPONS.blaster.damage * 0.78, now, 10, 1);
-  }
+  queuedShots = Math.max(0, queuedShots - shotsToProcess);
+  coopState.remoteLastAppliedShotSeq = Math.min(remoteShotSeq, remoteShotSeq - queuedShots);
 }
 
 function explodeGrenade(grenade, now) {
@@ -5264,7 +5602,7 @@ function update(dt, now) {
   state.beamActive = false;
   state.beamTarget = null;
 
-  if (state.pointer.down) {
+  if (state.pointer.down && state.status === "running") {
     if (state.weapon === "beam") {
       if (guestMirror) {
         state.beamActive = true;
@@ -5290,19 +5628,28 @@ function update(dt, now) {
 
   const ownCore = getOwnCorePosition();
   const allyCore = getAllyCorePosition();
+  const ownCoreAlive = state.hp > 0 && state.status !== "ko" && state.status !== "over";
   const ownCoreRadius = 16;
   const allyCoreRadius = 16;
   const slowMultiplier = state.effects.slow > 0 ? 0.6 : 1;
   const eventSpeed = getSpeedMultiplier();
 
+  if (!guestMirror && shouldRunHostKoSimulation()) {
+    for (let i = 0; i < state.zombies.length; i += 1) {
+      state.zombies[i].targetCore = "ally";
+    }
+  }
+
   if (!guestMirror) {
     for (let i = state.zombies.length - 1; i >= 0; i -= 1) {
       const zombie = state.zombies[i];
       const allyAlive = Boolean(allyCore) && coopState.remoteAlive;
-      const targetsAlly = allyAlive && zombie.targetCore === "ally";
+      const targetsAlly = allyAlive && (zombie.targetCore === "ally" || !ownCoreAlive);
 
       if (!targetsAlly && zombie.targetCore === "ally") {
         zombie.targetCore = "own";
+      } else if (targetsAlly && zombie.targetCore !== "ally") {
+        zombie.targetCore = "ally";
       }
 
       const targetX = targetsAlly ? allyCore.x : ownCore.x;
@@ -5375,13 +5722,28 @@ function update(dt, now) {
       }
     }
   } else {
+    const wsGuestMirror = isCoopWsEnabled();
     for (let i = 0; i < state.zombies.length; i += 1) {
       const zombie = state.zombies[i];
       zombie.wobble += dt * 3.4;
 
+      if (wsGuestMirror) {
+        const netX = Number(zombie.netX);
+        const netY = Number(zombie.netY);
+        if (Number.isFinite(netX) && Number.isFinite(netY)) {
+          zombie.x = netX;
+          zombie.y = netY;
+        }
+        zombie.vx = 0;
+        zombie.vy = 0;
+        zombie.x = clamp(zombie.x, -220, width + 220);
+        zombie.y = clamp(zombie.y, -220, height + 220);
+        continue;
+      }
+
       const netAt = Number(zombie.netAt) || 0;
       const netAge = netAt > 0 ? (performance.now() - netAt) / 1000 : 0;
-      const predictLead = isCoopWsEnabled()
+      const predictLead = wsGuestMirror
         ? clamp(0.02 + netAge * 0.22, 0.02, 0.085)
         : 0;
       const vx = Number(zombie.vx) || 0;
@@ -5392,7 +5754,7 @@ function update(dt, now) {
       const targetX = Number.isFinite(netX) ? netX + vx * predictLead : zombie.x;
       const targetY = Number.isFinite(netY) ? netY + vy * predictLead : zombie.y;
 
-      const responsiveness = isCoopWsEnabled()
+      const responsiveness = wsGuestMirror
         ? netAge > 0.3
           ? 20
           : 14
@@ -5461,6 +5823,60 @@ function update(dt, now) {
       bullet.x += (Number(bullet.vx) || 0) * dt;
       bullet.y += (Number(bullet.vy) || 0) * dt;
       bullet.life = Math.max(0, (Number(bullet.life) || 0) - dt);
+
+      // Локальные гостевые пули — только визуальный прогноз. При касании гасим их сразу,
+      // чтобы не выглядело как "пули летят сквозь зомби".
+      if (bullet.origin === "local") {
+        let consumed = false;
+        for (let j = state.zombies.length - 1; j >= 0; j -= 1) {
+          const zombie = state.zombies[j];
+          const dx = zombie.x - bullet.x;
+          const dy = zombie.y - bullet.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist < zombie.r + bullet.r + 1.5) {
+            state.bursts.push({
+              x: bullet.x,
+              y: bullet.y,
+              life: bullet.type === "grenade" ? 0.26 : 0.12,
+              max: bullet.type === "grenade" ? 0.26 : 0.12,
+              type: bullet.type === "grenade" ? "blast" : "shot",
+              origin: "local",
+            });
+            state.bullets.splice(i, 1);
+            consumed = true;
+            break;
+          }
+        }
+        if (consumed) {
+          continue;
+        }
+      }
+
+      // Для гостя любой снаряд на экране должен визуально сталкиваться с зомби.
+      // Урон всё равно считает только хост.
+      let visualHit = false;
+      for (let j = state.zombies.length - 1; j >= 0; j -= 1) {
+        const zombie = state.zombies[j];
+        const dx = zombie.x - bullet.x;
+        const dy = zombie.y - bullet.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < zombie.r + bullet.r + 1.5) {
+          state.bursts.push({
+            x: bullet.x,
+            y: bullet.y,
+            life: bullet.type === "grenade" ? 0.26 : 0.1,
+            max: bullet.type === "grenade" ? 0.26 : 0.1,
+            type: bullet.type === "grenade" ? "blast" : "shot",
+            origin: bullet.origin || "remote",
+          });
+          state.bullets.splice(i, 1);
+          visualHit = true;
+          break;
+        }
+      }
+      if (visualHit) {
+        continue;
+      }
 
       if (bullet.type === "grenade" && bullet.life <= 0) {
         state.bursts.push({ x: bullet.x, y: bullet.y, life: 0.34, max: 0.34, type: "blast" });
@@ -6266,7 +6682,14 @@ function tick(now) {
   const dt = Math.min(0.033, (now - lastTime) / 1000);
   lastTime = now;
 
-  if (state.running) {
+  if (coopState.active && coopState.roomStatus === "running" && isGuestMirrorMode()) {
+    const worldAge = now - (Number(coopState.lastWorldPacketAt) || 0);
+    if (Number(coopState.lastWorldPacketAt) > 0 && worldAge > 5000) {
+      fallbackGuestFromCoop("Связь с кооп-сервером потеряна. Игра продолжена в соло.");
+    }
+  }
+
+  if (state.running || shouldRunHostKoSimulation()) {
     update(dt, now);
   } else if (coopState.active && coopState.roomStatus === "running") {
     syncCoopState(now);
@@ -6294,9 +6717,11 @@ function setPointerFromEvent(event) {
 canvas.addEventListener("pointerdown", (event) => {
   const pos = setPointerFromEvent(event);
   state.pointer.active = true;
-  state.pointer.down = true;
+  state.pointer.down = state.status === "running";
   unlockAudio();
-  shoot(pos.x, pos.y, performance.now());
+  if (state.status === "running") {
+    shoot(pos.x, pos.y, performance.now());
+  }
   if (coopState.active) {
     syncCoopState(performance.now(), true);
   }
