@@ -132,6 +132,7 @@ const coopState = {
   remoteAimY: 0.5,
   remotePointerDown: false,
   remoteWeapon: "blaster",
+  remoteBeamDps: WEAPONS.beam.dps,
   remoteShotSeq: 0,
   remoteLastAppliedShotSeq: 0,
   remoteInputAt: 0,
@@ -390,7 +391,7 @@ function applyHpUpgrades(user) {
 function getCoreStatsFromProfile(profile = authState?.profile || null) {
   const { hpBonus, maxHpBonus } = applyHpUpgrades(profile);
   const maxHp = Math.max(1, 5 + maxHpBonus);
-  const startHp = Math.max(1, maxHp + hpBonus);
+  const startHp = clamp(5 + hpBonus, 1, maxHp);
   return { maxHp, startHp };
 }
 
@@ -452,6 +453,12 @@ function getBeamDpsAtLevels(damageLevel, fireRateLevel) {
   const damageMultiplier = 1 + (safeDamageLevel - 1) * 0.15;
   const fireMultiplier = 1 + Math.min(0.75, (safeFireRateLevel - 1) * 0.05);
   return WEAPONS.beam.dps * damageMultiplier * fireMultiplier;
+}
+
+function getBeamDpsFromProfile(profile = authState?.profile || null) {
+  const progress = profile?.weapons?.beam;
+  if (!progress) return WEAPONS.beam.dps;
+  return getBeamDpsAtLevels(progress.damageLevel, progress.fireRateLevel);
 }
 
 function formatCompactNumber(value, digits = 2) {
@@ -1795,6 +1802,7 @@ function resetCoopLocalState() {
   coopState.remoteAimY = 0.5;
   coopState.remotePointerDown = false;
   coopState.remoteWeapon = "blaster";
+  coopState.remoteBeamDps = WEAPONS.beam.dps;
   coopState.remoteShotSeq = 0;
   coopState.remoteLastAppliedShotSeq = 0;
   coopState.remoteInputAt = 0;
@@ -2154,6 +2162,7 @@ function handleCoopSnapshot(roomId, snap) {
   coopState.remoteWave = Math.max(1, Number(remoteSlot?.wave || 1));
   coopState.remoteScore = Math.max(0, Number(remoteSlot?.score || 0));
   if (!coopState.remoteConnected) {
+    coopState.remoteBeamDps = WEAPONS.beam.dps;
     coopState.remoteShotSeq = 0;
     coopState.remoteLastAppliedShotSeq = 0;
   }
@@ -2172,6 +2181,10 @@ function handleCoopSnapshot(roomId, snap) {
     coopState.remoteAimY = clamp(Number(remoteSlot.aimY), 0, 1);
   }
   coopState.remoteWeapon = WEAPONS[remoteSlot?.weapon] ? remoteSlot.weapon : "blaster";
+  const remoteBeamDpsRaw = Number(remoteSlot?.beamDps);
+  coopState.remoteBeamDps = Number.isFinite(remoteBeamDpsRaw)
+    ? clamp(remoteBeamDpsRaw, 0.5, 80)
+    : WEAPONS.beam.dps;
   coopState.remoteInputAt = Math.max(0, Number(remoteSlot?.inputAt || 0));
   if (coopState.remoteConnected) {
     coopState.remoteLastPacketAt = performance.now();
@@ -2379,7 +2392,6 @@ async function createCoopLobby() {
             inputAt: Date.now(),
             updatedAt: Date.now(),
           },
-          guest: null,
         }), 8000, "coop-write-timeout");
       };
       await runCoopOpWithRepair(writeCandidate, "coop-write-timeout");
@@ -2696,13 +2708,6 @@ function syncCoopWorldState(now) {
   }
   coopState.lastWorldPayloadKey = snapshotKey;
 
-  if (isCoopWsEnabled()) {
-    coopWsSendFast("set", "world", coopState.roomId, snapshot).catch((error) => {
-      console.error("Coop WS world fast sync error:", error);
-    });
-    return;
-  }
-
   if (coopState.worldWriteInFlight) {
     coopState.worldPendingSnapshot = snapshot;
     return;
@@ -2728,6 +2733,7 @@ function syncCoopState(now, force = false) {
   const ownScore = Math.max(0, state.score);
   const ownWave = Math.max(1, state.wave);
   const ownShotSeq = Math.max(0, Math.floor(coopState.localShotSeq || 0));
+  const ownBeamDps = clamp(getBeamDpsFromProfile(authState.profile), 0.5, 80);
 
   let payload = {
     updatedAt: makeServerTimestamp(),
@@ -2741,6 +2747,7 @@ function syncCoopState(now, force = false) {
     [`${role}/aimY`]: aimY,
     [`${role}/pointerDown`]: pointerDown,
     [`${role}/weapon`]: WEAPONS[state.weapon] ? state.weapon : "blaster",
+    [`${role}/beamDps`]: ownBeamDps,
     [`${role}/shotSeq`]: ownShotSeq,
     [`${role}/inputAt`]: Date.now(),
     [`${role}/updatedAt`]: Date.now(),
@@ -2755,6 +2762,7 @@ function syncCoopState(now, force = false) {
       [`${role}/aimY`]: aimY,
       [`${role}/pointerDown`]: pointerDown,
       [`${role}/weapon`]: WEAPONS[state.weapon] ? state.weapon : "blaster",
+      [`${role}/beamDps`]: ownBeamDps,
       [`${role}/shotSeq`]: ownShotSeq,
       [`${role}/inputAt`]: Date.now(),
       [`${role}/updatedAt`]: Date.now(),
@@ -2773,11 +2781,6 @@ function syncCoopState(now, force = false) {
 
     if (role === "host") {
       payload.sharedWave = ownWave;
-      if (coopState.remoteConnected && coopState.roomStatus === "running") {
-        payload["guest/hp"] = Math.max(0, Number(coopState.remoteHp) || 0);
-        payload["guest/maxHp"] = Math.max(1, Number(coopState.remoteMaxHp) || 5);
-        payload["guest/alive"] = payload["guest/hp"] > 0;
-      }
     }
 
     if (state.status === "running") {
@@ -2794,6 +2797,7 @@ function syncCoopState(now, force = false) {
         aimY,
         pointerDown ? 1 : 0,
         payload[`${role}/weapon`],
+        formatCompactNumber(ownBeamDps, 2),
         ownShotSeq,
         state.status,
         payload.status || "",
@@ -2809,13 +2813,11 @@ function syncCoopState(now, force = false) {
         aimY,
         pointerDown ? 1 : 0,
         payload[`${role}/weapon`],
+        formatCompactNumber(ownBeamDps, 2),
         ownShotSeq,
         state.status,
         payload.status || "",
         payload.sharedWave || "",
-        payload["guest/hp"] ?? "",
-        payload["guest/maxHp"] ?? "",
-        payload["guest/alive"] ?? "",
       ];
   const payloadKey = payloadKeyParts.join("|");
   if (payloadKey === coopState.lastRoomPayloadKey) {
@@ -2860,7 +2862,15 @@ const authUiState = {
 
 function getUsers() {
   const data = localStorage.getItem(STORAGE_KEYS.USERS);
-  return data ? JSON.parse(data) : {};
+  if (!data) return {};
+  try {
+    const parsed = JSON.parse(data);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (error) {
+    console.error("Users localStorage parse error:", error);
+    localStorage.removeItem(STORAGE_KEYS.USERS);
+    return {};
+  }
 }
 
 function saveUsersLocalOnly(users) {
@@ -5437,7 +5447,7 @@ function applyRemoteSupportFire(dt, now) {
     coopState.remoteBeamActive = true;
     coopState.remoteBeamTarget = { x: target.x, y: target.y };
     if (canApplyDamage) {
-      const beamDps = WEAPONS.beam.dps;
+      const beamDps = clamp(Number(coopState.remoteBeamDps) || WEAPONS.beam.dps, 0.5, 80);
       applyRemoteRayDamage(
         allyCore.x,
         allyCore.y,
@@ -5613,7 +5623,7 @@ function update(dt, now) {
 
   // Update muzzle flash
   if (state.muzzleFlash > 0) {
-    state.muzzleFlash -= 0.15;
+    state.muzzleFlash -= dt * 9;
     if (state.muzzleFlash < 0) state.muzzleFlash = 0;
   }
   if (coopState.remoteMuzzle > 0) {
@@ -6893,3 +6903,1522 @@ window.addEventListener("resize", () => {
   resizeCanvas();
   renderEncyclopediaZombiePreviews();
 });
+
+(() => {
+  const modePager = document.getElementById("modePager");
+  const modeTrack = document.getElementById("modeTrack");
+  const modeTabs = Array.from(document.querySelectorAll(".mode-tab"));
+  const tdCanvas = document.getElementById("tdCanvas");
+  const tdBaseHpEl = document.getElementById("tdBaseHp");
+  const tdGoldEl = document.getElementById("tdGold");
+  const tdWaveEl = document.getElementById("tdWave");
+  const tdCoreCountEl = document.getElementById("tdCoreCount");
+  const tdBuyBtn = document.getElementById("tdBuyBtn");
+  const tdUpgradeBtn = document.getElementById("tdUpgradeBtn");
+  const tdStartWaveBtn = document.getElementById("tdStartWaveBtn");
+  const tdSelectionInfo = document.getElementById("tdSelectionInfo");
+  const tdOverlay = document.getElementById("tdOverlay");
+  const tdOverlayTitle = document.getElementById("tdOverlayTitle");
+  const tdOverlayText = document.getElementById("tdOverlayText");
+  const tdOverlayBtn = document.getElementById("tdOverlayBtn");
+
+  if (!modePager || !modeTrack || !tdCanvas) return;
+
+  const tdCtx = tdCanvas.getContext("2d");
+  if (!tdCtx) return;
+
+  const TD_COLS = 5;
+  const TD_ROWS = 3;
+  const TD_CELL_COUNT = TD_COLS * TD_ROWS;
+  const TD_STORAGE_KEY = "zombiesurge_td_mode_v1";
+  const TD_MAX_BASE_HP = 10;
+  const TD_INITIAL_GOLD = 100;
+  const TD_MAX_RANK = 8;
+  const TD_MAX_LEVEL = 6;
+  const TD_RANK_COLORS = [
+    "#6fe2b0",
+    "#6bc3ff",
+    "#c28bff",
+    "#ffb266",
+    "#ff7e6c",
+    "#ffe47b",
+    "#ff9ef6",
+    "#ffffff",
+  ];
+  const TD_CORE_ICONS = ["⚙️", "🔥", "❄️", "⚡", "🧪", "☄️", "👑", "💎"];
+
+  const modeState = {
+    page: 0,
+    swipeActive: false,
+    startX: 0,
+    startY: 0,
+    pointerId: null,
+  };
+
+  const tdState = {
+    running: false,
+    waveActive: false,
+    over: false,
+    maxBaseHp: TD_MAX_BASE_HP,
+    baseHp: TD_MAX_BASE_HP,
+    gold: TD_INITIAL_GOLD,
+    wave: 1,
+    cores: new Array(TD_CELL_COUNT).fill(null),
+    selectedCell: null,
+    drag: {
+      active: false,
+      sourceCell: -1,
+      pointerId: null,
+      pointerX: 0,
+      pointerY: 0,
+    },
+    zombies: [],
+    projectiles: [],
+    effects: [],
+    spawnQueue: [],
+    waveTime: 0,
+    nextCoreId: 1,
+    nextZombieId: 1,
+    hint: null,
+    profileGoldBuffer: 0,
+    lastProfileGoldFlushAt: 0,
+  };
+
+  const tdGeom = {
+    pad: 0,
+    gridX: 0,
+    gridY: 0,
+    gridW: 0,
+    gridH: 0,
+    cellW: 0,
+    cellH: 0,
+    pathWidth: 0,
+    pathPoints: [],
+    pathSegmentLengths: [],
+    pathTotalLength: 0,
+    baseX: 0,
+    baseY: 0,
+    baseR: 0,
+  };
+
+  let tdWidth = 0;
+  let tdHeight = 0;
+  let tdLastTime = performance.now();
+  let tdRafId = 0;
+
+  function tdClamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function tdMakeCore(rank = 1, level = 1) {
+    return {
+      id: tdState.nextCoreId++,
+      rank: tdClamp(Math.round(rank), 1, TD_MAX_RANK),
+      level: tdClamp(Math.round(level), 1, TD_MAX_LEVEL),
+      cooldown: randomRange(0.02, 0.22),
+      recoil: 0,
+      aim: 0,
+    };
+  }
+
+  function tdGetCoreStats(core) {
+    const rankFactor = 1 + (core.rank - 1) * 0.62;
+    const levelFactor = 1 + (core.level - 1) * 0.28;
+    return {
+      damage: 0.96 * rankFactor * levelFactor,
+      fireRate: 1.42 + (core.rank - 1) * 0.2 + (core.level - 1) * 0.15,
+      range: 176 + core.rank * 21 + core.level * 8,
+    };
+  }
+
+  function tdCoreColor(rank = 1) {
+    const index = tdClamp(Math.round(rank) - 1, 0, TD_RANK_COLORS.length - 1);
+    return TD_RANK_COLORS[index];
+  }
+
+  function tdCoreIcon(rank = 1) {
+    const index = tdClamp(Math.round(rank) - 1, 0, TD_CORE_ICONS.length - 1);
+    return TD_CORE_ICONS[index];
+  }
+
+  function tdRoundRectPath(x, y, w, h, r) {
+    const rr = Math.max(0, Math.min(r, w * 0.5, h * 0.5));
+    tdCtx.beginPath();
+    tdCtx.moveTo(x + rr, y);
+    tdCtx.lineTo(x + w - rr, y);
+    tdCtx.quadraticCurveTo(x + w, y, x + w, y + rr);
+    tdCtx.lineTo(x + w, y + h - rr);
+    tdCtx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+    tdCtx.lineTo(x + rr, y + h);
+    tdCtx.quadraticCurveTo(x, y + h, x, y + h - rr);
+    tdCtx.lineTo(x, y + rr);
+    tdCtx.quadraticCurveTo(x, y, x + rr, y);
+  }
+
+  function tdGetBuyCost() {
+    const used = tdState.cores.filter(Boolean).length;
+    return Math.round(60 + used * 24 + Math.max(0, tdState.wave - 1) * 8);
+  }
+
+  function tdGetUpgradeCost(core) {
+    if (!core) return Infinity;
+    return Math.round(54 * core.rank * (1 + (core.level - 1) * 0.85));
+  }
+
+  function tdGetCoreCount() {
+    return tdState.cores.filter(Boolean).length;
+  }
+
+  function tdCellToPosition(index) {
+    const col = index % TD_COLS;
+    const row = Math.floor(index / TD_COLS);
+    return {
+      x: tdGeom.gridX + tdGeom.cellW * (col + 0.5),
+      y: tdGeom.gridY + tdGeom.cellH * (row + 0.5),
+      col,
+      row,
+    };
+  }
+
+  function tdGetCellAt(x, y) {
+    if (x < tdGeom.gridX || y < tdGeom.gridY) return -1;
+    if (x > tdGeom.gridX + tdGeom.gridW || y > tdGeom.gridY + tdGeom.gridH) return -1;
+    const col = Math.floor((x - tdGeom.gridX) / tdGeom.cellW);
+    const row = Math.floor((y - tdGeom.gridY) / tdGeom.cellH);
+    if (col < 0 || col >= TD_COLS || row < 0 || row >= TD_ROWS) return -1;
+    return row * TD_COLS + col;
+  }
+
+  function tdFindStarterIndex() {
+    return 1 * TD_COLS + 2;
+  }
+
+  function tdEnsureStarterCore() {
+    if (tdState.cores.some(Boolean)) return;
+    const starterIndex = tdFindStarterIndex();
+    tdState.cores[starterIndex] = tdMakeCore(1, 1);
+    tdState.selectedCell = starterIndex;
+  }
+
+  function tdPushHint(text, tone = "info") {
+    tdState.hint = {
+      text,
+      tone,
+      until: performance.now() + 2600,
+    };
+  }
+
+  function tdResolveSelectionText() {
+    const now = performance.now();
+    if (tdState.hint && tdState.hint.until > now) {
+      return tdState.hint;
+    }
+    tdState.hint = null;
+
+    if (tdState.drag.active) {
+      return {
+        text: "Перетащи ядро на пустую клетку, либо на ядро такого же ранга для слияния.",
+        tone: "info",
+      };
+    }
+
+    if (Number.isInteger(tdState.selectedCell) && tdState.selectedCell >= 0) {
+      const selected = tdState.cores[tdState.selectedCell];
+      if (selected) {
+        const stats = tdGetCoreStats(selected);
+        return {
+          text: `Ядро R${selected.rank} Lv.${selected.level} · Урон ${formatCompactNumber(
+            stats.damage,
+            2
+          )} · Скорость ${formatCompactNumber(stats.fireRate, 2)}/с · Дальность ${Math.round(stats.range)}.`,
+          tone: "ok",
+        };
+      }
+      return {
+        text: "Пустая ячейка. Можно перетащить сюда ядро или купить новое.",
+        tone: "info",
+      };
+    }
+
+    return {
+      text: "Зажми ядро и перетащи: на пустую клетку для переноса, на такое же для слияния.",
+      tone: "info",
+    };
+  }
+
+  function tdSave() {
+    try {
+      const payload = {
+        maxBaseHp: TD_MAX_BASE_HP,
+        baseHp: tdState.baseHp,
+        gold: tdState.gold,
+        wave: tdState.wave,
+        selectedCell: tdState.selectedCell,
+        nextCoreId: tdState.nextCoreId,
+        nextZombieId: tdState.nextZombieId,
+        cores: tdState.cores.map((core) =>
+          core
+            ? {
+                rank: core.rank,
+                level: core.level,
+              }
+            : null
+        ),
+      };
+      localStorage.setItem(TD_STORAGE_KEY, JSON.stringify(payload));
+    } catch (error) {
+      // ignore storage errors
+    }
+  }
+
+  function tdAwardProfileGold(amount) {
+    const value = Math.max(0, Math.floor(Number(amount) || 0));
+    if (value <= 0) return;
+    tdState.profileGoldBuffer += value;
+  }
+
+  function tdFlushProfileGold() {
+    const amount = Math.max(0, Math.floor(tdState.profileGoldBuffer || 0));
+    if (amount <= 0) return;
+    if (!authState.user || !authState.profile) return;
+
+    const users = getUsers();
+    const email = authState.user.email;
+    if (!email || !users[email]) return;
+
+    users[email] = migrateProfile(users[email]);
+    users[email].gold = Math.max(0, Number(users[email].gold) || 0) + amount;
+    tdState.profileGoldBuffer = 0;
+    saveUsers(users);
+    if (typeof updateShopUI === "function") {
+      updateShopUI();
+    } else {
+      updateAuthUI();
+    }
+  }
+
+  function tdLoad() {
+    let parsed = null;
+    try {
+      const raw = localStorage.getItem(TD_STORAGE_KEY);
+      if (raw) parsed = JSON.parse(raw);
+    } catch (error) {
+      parsed = null;
+    }
+
+    if (parsed && typeof parsed === "object") {
+      tdState.baseHp = tdClamp(Number(parsed.baseHp) || TD_MAX_BASE_HP, 0, TD_MAX_BASE_HP);
+      tdState.gold = Math.max(0, Number(parsed.gold) || TD_INITIAL_GOLD);
+      tdState.wave = Math.max(1, Math.floor(Number(parsed.wave) || 1));
+      tdState.selectedCell = Number.isInteger(parsed.selectedCell) ? parsed.selectedCell : null;
+      tdState.nextCoreId = Math.max(1, Math.floor(Number(parsed.nextCoreId) || 1));
+      tdState.nextZombieId = Math.max(1, Math.floor(Number(parsed.nextZombieId) || 1));
+
+      if (Array.isArray(parsed.cores) && parsed.cores.length === TD_CELL_COUNT) {
+        tdState.cores = parsed.cores.map((core) => {
+          if (!core || typeof core !== "object") return null;
+          return tdMakeCore(core.rank, core.level);
+        });
+      }
+    }
+
+    tdState.running = false;
+    tdState.waveActive = false;
+    tdState.over = tdState.baseHp <= 0;
+    tdState.drag.active = false;
+    tdState.drag.sourceCell = -1;
+    tdState.drag.pointerId = null;
+    tdState.zombies = [];
+    tdState.projectiles = [];
+    tdState.effects = [];
+    tdState.spawnQueue = [];
+    tdState.waveTime = 0;
+
+    tdEnsureStarterCore();
+    if (!Number.isInteger(tdState.selectedCell) || tdState.selectedCell < 0) {
+      tdState.selectedCell = tdFindStarterIndex();
+    }
+  }
+
+  function tdShowOverlay(title, text, buttonText) {
+    if (!tdOverlay || !tdOverlayTitle || !tdOverlayText || !tdOverlayBtn) return;
+    tdOverlayTitle.textContent = title;
+    tdOverlayText.textContent = text;
+    tdOverlayBtn.textContent = buttonText;
+    tdOverlay.classList.remove("hidden");
+  }
+
+  function tdHideOverlay() {
+    if (!tdOverlay) return;
+    tdOverlay.classList.add("hidden");
+  }
+
+  function tdReset() {
+    tdState.running = false;
+    tdState.waveActive = false;
+    tdState.over = false;
+    tdState.baseHp = TD_MAX_BASE_HP;
+    tdState.maxBaseHp = TD_MAX_BASE_HP;
+    tdState.gold = TD_INITIAL_GOLD;
+    tdState.wave = 1;
+    tdState.cores = new Array(TD_CELL_COUNT).fill(null);
+    tdState.selectedCell = null;
+    tdState.drag.active = false;
+    tdState.drag.sourceCell = -1;
+    tdState.drag.pointerId = null;
+    tdState.zombies = [];
+    tdState.projectiles = [];
+    tdState.effects = [];
+    tdState.spawnQueue = [];
+    tdState.waveTime = 0;
+    tdState.nextCoreId = 1;
+    tdState.nextZombieId = 1;
+    tdState.hint = null;
+    tdState.profileGoldBuffer = 0;
+    tdState.lastProfileGoldFlushAt = 0;
+    tdEnsureStarterCore();
+    tdLastTime = performance.now();
+    tdScheduleTick();
+    tdShowOverlay(
+      "Готов к волне?",
+      "Построй оборону на сетке 5x3 и не дай зомби дойти до базы.",
+      "Играть"
+    );
+    tdSave();
+    tdUpdateUi();
+  }
+
+  function tdUpdateUi() {
+    if (tdBaseHpEl) {
+      tdBaseHpEl.textContent = `${Math.max(0, Math.round(tdState.baseHp))} / ${TD_MAX_BASE_HP}`;
+    }
+    if (tdGoldEl) {
+      tdGoldEl.textContent = `${Math.floor(tdState.gold)}`;
+    }
+    if (tdWaveEl) {
+      tdWaveEl.textContent = `${tdState.wave}`;
+    }
+    if (tdCoreCountEl) {
+      tdCoreCountEl.textContent = `${tdGetCoreCount()} / ${TD_CELL_COUNT}`;
+    }
+
+    const selectedCore =
+      Number.isInteger(tdState.selectedCell) && tdState.selectedCell >= 0
+        ? tdState.cores[tdState.selectedCell]
+        : null;
+    const buyCost = tdGetBuyCost();
+    const upgradeCost = tdGetUpgradeCost(selectedCore);
+    const hasEmptySlot = tdState.cores.some((core) => !core);
+
+    if (tdBuyBtn) {
+      tdBuyBtn.textContent = `⚡ Призвать (${buyCost})`;
+      tdBuyBtn.disabled = !hasEmptySlot || tdState.gold < buyCost || tdState.over;
+    }
+    if (tdUpgradeBtn) {
+      tdUpgradeBtn.textContent = selectedCore ? `⬆️ Ап (${upgradeCost})` : "⬆️ Улучшить";
+      tdUpgradeBtn.disabled =
+        !selectedCore ||
+        tdState.gold < upgradeCost ||
+        tdState.over ||
+        selectedCore.level >= TD_MAX_LEVEL;
+    }
+    if (tdStartWaveBtn) {
+      tdStartWaveBtn.textContent = tdState.waveActive ? "🏁 Волна..." : "🏁 Волна";
+      tdStartWaveBtn.disabled = tdState.waveActive || tdState.over;
+    }
+
+    if (tdSelectionInfo) {
+      const hint = tdResolveSelectionText();
+      tdSelectionInfo.textContent = hint.text;
+      if (hint.tone === "error") {
+        tdSelectionInfo.style.color = "#ff9d9d";
+        tdSelectionInfo.style.borderColor = "rgba(255, 108, 108, 0.42)";
+      } else if (hint.tone === "ok") {
+        tdSelectionInfo.style.color = "#abffcf";
+        tdSelectionInfo.style.borderColor = "rgba(111, 226, 176, 0.42)";
+      } else {
+        tdSelectionInfo.style.color = "";
+        tdSelectionInfo.style.borderColor = "";
+      }
+    }
+  }
+
+  function tdSpawnZombie(item) {
+    if (!tdGeom.pathPoints || tdGeom.pathPoints.length < 2) return;
+    const start = tdGeom.pathPoints[0];
+    tdState.zombies.push({
+      id: tdState.nextZombieId++,
+      x: start.x,
+      y: start.y,
+      r: item.r,
+      hp: item.hp,
+      maxHp: item.maxHp,
+      speed: item.speed,
+      reward: item.reward,
+      bob: Math.random() * Math.PI * 2,
+      waypoint: 1,
+      progress: 0,
+    });
+  }
+
+  function tdStartWave() {
+    if (tdState.waveActive) return;
+    if (tdState.over) {
+      tdReset();
+      return;
+    }
+
+    tdState.running = true;
+    tdState.waveActive = true;
+    tdState.waveTime = 0;
+    tdState.spawnQueue = [];
+    tdState.hint = null;
+    tdHideOverlay();
+    tdLastTime = performance.now();
+    tdScheduleTick();
+
+    const spawnCount = 8 + Math.floor(tdState.wave * 2.2);
+    const interval = Math.max(0.28, 0.72 - tdState.wave * 0.022);
+    for (let i = 0; i < spawnCount; i += 1) {
+      const hp = 2.2 + tdState.wave * 0.62 + Math.random() * 0.8;
+      const r = 9 + Math.min(10, tdState.wave * 0.18);
+      const speed = 30 + tdState.wave * 2.3 + Math.random() * 5.5;
+      const reward = Math.max(4, Math.round(5 + tdState.wave * 0.6));
+      tdState.spawnQueue.push({
+        t: i * interval + Math.random() * 0.12,
+        hp,
+        maxHp: hp,
+        speed,
+        reward,
+        r,
+      });
+    }
+
+    tdUpdateUi();
+    tdSave();
+  }
+
+  function tdCompleteWave() {
+    if (!tdState.waveActive) return;
+    tdState.waveActive = false;
+    tdState.running = false;
+    const clearedWave = tdState.wave;
+    const reward = Math.round(16 + tdState.wave * 4);
+    tdState.gold += reward;
+    tdAwardProfileGold(reward);
+    tdFlushProfileGold();
+    tdState.wave += 1;
+    tdShowOverlay(
+      `Волна ${clearedWave} очищена`,
+      `Награда +${reward} золота. Улучшай ядра и запускай следующую волну.`,
+      "Следующая волна"
+    );
+    tdPushHint(`Волна ${clearedWave} отбита. +${reward} золота.`, "ok");
+    tdUpdateUi();
+    tdSave();
+  }
+
+  function tdGameOver() {
+    if (tdState.over) return;
+    tdState.over = true;
+    tdState.running = false;
+    tdState.waveActive = false;
+    tdState.spawnQueue = [];
+    tdState.projectiles = [];
+    tdFlushProfileGold();
+    tdShowOverlay(
+      "База уничтожена",
+      `Ты продержался до волны ${tdState.wave}. Нажми, чтобы начать заново.`,
+      "Заново"
+    );
+    tdPushHint("База уничтожена. Попробуй другой билд ядер.", "error");
+    tdUpdateUi();
+    tdSave();
+  }
+
+  function tdBuyCore() {
+    if (tdState.over) return;
+    const cost = tdGetBuyCost();
+    if (tdState.gold < cost) {
+      tdPushHint("Недостаточно золота для покупки ядра.", "error");
+      tdUpdateUi();
+      return;
+    }
+
+    let targetCell = Number.isInteger(tdState.selectedCell) ? tdState.selectedCell : -1;
+    if (targetCell < 0 || tdState.cores[targetCell]) {
+      targetCell = tdState.cores.findIndex((core) => !core);
+    }
+    if (targetCell < 0) {
+      tdPushHint("Сетка заполнена. Улучшай или сливай ядра.", "error");
+      tdUpdateUi();
+      return;
+    }
+
+    tdState.gold -= cost;
+    tdState.cores[targetCell] = tdMakeCore(1, 1);
+    tdState.selectedCell = targetCell;
+    const pos = tdCellToPosition(targetCell);
+    tdState.effects.push({
+      x: pos.x,
+      y: pos.y,
+      life: 0.6,
+      max: 0.6,
+      kind: "spawn",
+    });
+    tdPushHint("Новое ядро поставлено на поле.", "ok");
+    tdUpdateUi();
+    tdSave();
+  }
+
+  function tdUpgradeSelected() {
+    if (tdState.over) return;
+    if (!Number.isInteger(tdState.selectedCell) || tdState.selectedCell < 0) {
+      tdPushHint("Сначала выбери ядро для улучшения.", "error");
+      tdUpdateUi();
+      return;
+    }
+
+    const core = tdState.cores[tdState.selectedCell];
+    if (!core) {
+      tdPushHint("Выбранная ячейка пуста.", "error");
+      tdUpdateUi();
+      return;
+    }
+    if (core.level >= TD_MAX_LEVEL) {
+      tdPushHint("Это ядро уже максимального уровня.", "error");
+      tdUpdateUi();
+      return;
+    }
+
+    const cost = tdGetUpgradeCost(core);
+    if (tdState.gold < cost) {
+      tdPushHint("Недостаточно золота для улучшения.", "error");
+      tdUpdateUi();
+      return;
+    }
+
+    tdState.gold -= cost;
+    core.level = tdClamp(core.level + 1, 1, TD_MAX_LEVEL);
+    tdPushHint(`Ядро улучшено до Lv.${core.level}.`, "ok");
+    tdUpdateUi();
+    tdSave();
+  }
+
+  function tdSelectCell(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= TD_CELL_COUNT) return;
+    tdState.selectedCell = index;
+    const core = tdState.cores[index];
+    if (!core) {
+      tdUpdateUi();
+      return;
+    }
+    tdUpdateUi();
+    tdSave();
+  }
+
+  function tdDropCore(sourceCell, targetCell) {
+    if (!Number.isInteger(sourceCell) || sourceCell < 0 || sourceCell >= TD_CELL_COUNT) return;
+    if (!Number.isInteger(targetCell) || targetCell < 0 || targetCell >= TD_CELL_COUNT) {
+      tdSelectCell(sourceCell);
+      return;
+    }
+    if (sourceCell === targetCell) {
+      tdSelectCell(sourceCell);
+      return;
+    }
+
+    const sourceCore = tdState.cores[sourceCell];
+    if (!sourceCore) {
+      tdUpdateUi();
+      return;
+    }
+
+    const targetCore = tdState.cores[targetCell];
+    if (!targetCore) {
+      tdState.cores[targetCell] = sourceCore;
+      tdState.cores[sourceCell] = null;
+      tdState.selectedCell = targetCell;
+      tdPushHint("Ядро перемещено.", "ok");
+      tdUpdateUi();
+      tdSave();
+      return;
+    }
+
+    if (targetCore.rank === sourceCore.rank) {
+      const targetRank = Math.min(TD_MAX_RANK, targetCore.rank + 1);
+      targetCore.rank = targetRank;
+      targetCore.level = 1;
+      targetCore.cooldown = Math.min(targetCore.cooldown, 0.12);
+      tdState.cores[sourceCell] = null;
+      tdState.selectedCell = targetCell;
+      const pos = tdCellToPosition(targetCell);
+      tdState.effects.push({
+        x: pos.x,
+        y: pos.y,
+        life: 0.72,
+        max: 0.72,
+        kind: "merge",
+      });
+      tdPushHint(`Слияние: ядро стало R${targetRank}.`, "ok");
+      tdUpdateUi();
+      tdSave();
+      return;
+    }
+
+    tdPushHint("Слияние возможно только с ядром такого же ранга.", "error");
+    tdSelectCell(sourceCell);
+  }
+
+  function tdUpdateGeometry() {
+    tdGeom.pad = tdClamp(tdWidth * 0.02, 12, 20);
+
+    const leftPathSpace = tdClamp(tdWidth * 0.075, 16, 34);
+    const rightPathSpace = tdClamp(tdWidth * 0.08, 16, 36);
+    const topPathSpace = tdClamp(tdHeight * 0.11, 18, 42);
+    const bottomPathSpace = tdClamp(tdHeight * 0.08, 14, 34);
+
+    const boardWMax = Math.max(160, tdWidth - tdGeom.pad * 2 - leftPathSpace - rightPathSpace);
+    const boardHMax = Math.max(110, tdHeight - tdGeom.pad * 2 - topPathSpace - bottomPathSpace);
+    let boardW = boardWMax;
+    let boardH = boardW * (TD_ROWS / TD_COLS);
+    if (boardH > boardHMax) {
+      boardH = boardHMax;
+      boardW = boardH * (TD_COLS / TD_ROWS);
+    }
+
+    tdGeom.gridX = tdGeom.pad + leftPathSpace;
+    tdGeom.gridY = tdGeom.pad + topPathSpace;
+    tdGeom.gridW = boardW;
+    tdGeom.gridH = boardH;
+    tdGeom.cellW = boardW / TD_COLS;
+    tdGeom.cellH = boardH / TD_ROWS;
+
+    tdGeom.pathWidth = tdClamp(tdWidth * 0.05, 16, 24);
+    const pathXLeft = tdGeom.gridX - leftPathSpace * 0.5;
+    const pathYBottom = tdGeom.gridY + tdGeom.gridH + bottomPathSpace * 0.5;
+    const pathYTop = tdGeom.gridY - topPathSpace * 0.44;
+    const pathXRight = tdGeom.gridX + tdGeom.gridW + rightPathSpace * 0.5;
+    const doorY = tdGeom.gridY + tdGeom.gridH * 0.7;
+
+    tdGeom.pathPoints = [
+      { x: pathXLeft, y: pathYBottom },
+      { x: pathXLeft, y: pathYTop },
+      { x: pathXRight, y: pathYTop },
+      { x: pathXRight, y: doorY },
+    ];
+    tdGeom.pathSegmentLengths = [];
+    tdGeom.pathTotalLength = 0;
+    for (let i = 1; i < tdGeom.pathPoints.length; i += 1) {
+      const a = tdGeom.pathPoints[i - 1];
+      const b = tdGeom.pathPoints[i];
+      const len = Math.hypot(b.x - a.x, b.y - a.y);
+      tdGeom.pathSegmentLengths.push(len);
+      tdGeom.pathTotalLength += len;
+    }
+
+    tdGeom.baseX = pathXRight;
+    tdGeom.baseY = doorY;
+    tdGeom.baseR = tdClamp(tdWidth * 0.028, 14, 20);
+  }
+
+  function tdResizeCanvas() {
+    const rect = tdCanvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const dprRaw = window.devicePixelRatio || 1;
+    const dpr = Math.min(dprRaw, window.matchMedia("(max-width: 900px)").matches ? 1.25 : 1.8);
+    tdCanvas.width = Math.round(rect.width * dpr);
+    tdCanvas.height = Math.round(rect.height * dpr);
+    tdCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    tdWidth = rect.width;
+    tdHeight = rect.height;
+    tdUpdateGeometry();
+  }
+
+  function tdApplyZombieHit(zombieIndex, damage) {
+    const zombie = tdState.zombies[zombieIndex];
+    if (!zombie) return;
+    zombie.hp -= damage;
+    tdState.effects.push({
+      x: zombie.x,
+      y: zombie.y,
+      life: 0.24,
+      max: 0.24,
+      kind: "hit",
+    });
+    if (zombie.hp <= 0) {
+      tdState.gold += zombie.reward;
+      tdAwardProfileGold(zombie.reward);
+      tdState.effects.push({
+        x: zombie.x,
+        y: zombie.y,
+        life: 0.42,
+        max: 0.42,
+        kind: "kill",
+      });
+      tdState.zombies.splice(zombieIndex, 1);
+      tdUpdateUi();
+      tdSave();
+    }
+  }
+
+  function tdUpdateWave(dt) {
+    if (!tdState.waveActive) return;
+
+    tdState.waveTime += dt;
+    const liveCap = 10 + Math.floor(tdState.wave * 2.2);
+    while (tdState.spawnQueue.length > 0 && tdState.spawnQueue[0].t <= tdState.waveTime) {
+      if (tdState.zombies.length >= liveCap) {
+        break;
+      }
+      tdSpawnZombie(tdState.spawnQueue.shift());
+    }
+
+    if (tdState.spawnQueue.length === 0 && tdState.zombies.length === 0) {
+      tdCompleteWave();
+    }
+  }
+
+  function tdUpdateCores(dt) {
+    if (!tdState.running) return;
+    if (tdState.zombies.length === 0) return;
+
+    for (let i = 0; i < tdState.cores.length; i += 1) {
+      const core = tdState.cores[i];
+      if (!core) continue;
+      core.cooldown -= dt;
+      core.recoil *= 0.87;
+      if (core.cooldown > 0) continue;
+
+      const origin = tdCellToPosition(i);
+      const stats = tdGetCoreStats(core);
+
+      let bestIndex = -1;
+      let bestScore = -Infinity;
+      for (let zi = 0; zi < tdState.zombies.length; zi += 1) {
+        const zombie = tdState.zombies[zi];
+        const dx = zombie.x - origin.x;
+        const dy = zombie.y - origin.y;
+        const dist = Math.hypot(dx, dy) || 1;
+        if (dist > stats.range) continue;
+        const priority = (Number(zombie.progress) || 0) + (stats.range - dist) * 0.18;
+        if (priority > bestScore) {
+          bestScore = priority;
+          bestIndex = zi;
+        }
+      }
+
+      if (bestIndex < 0) continue;
+      const target = tdState.zombies[bestIndex];
+      const dx = target.x - origin.x;
+      const dy = target.y - origin.y;
+      const dist = Math.hypot(dx, dy) || 1;
+      const nx = dx / dist;
+      const ny = dy / dist;
+      core.aim = Math.atan2(ny, nx);
+      core.recoil = 1;
+      core.cooldown = 1 / Math.max(0.2, stats.fireRate);
+
+      const speed = 520 + core.rank * 46 + core.level * 20;
+      tdState.projectiles.push({
+        x: origin.x + nx * 18,
+        y: origin.y + ny * 18,
+        vx: nx * speed,
+        vy: ny * speed,
+        damage: stats.damage,
+        life: 1.1,
+        color: tdCoreColor(core.rank),
+      });
+      tdState.effects.push({
+        x: origin.x + nx * 14,
+        y: origin.y + ny * 14,
+        life: 0.14,
+        max: 0.14,
+        kind: "muzzle",
+        color: tdCoreColor(core.rank),
+      });
+    }
+  }
+
+  function tdUpdateProjectiles(dt) {
+    if (tdState.projectiles.length === 0) return;
+    for (let i = tdState.projectiles.length - 1; i >= 0; i -= 1) {
+      const p = tdState.projectiles[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+      if (
+        p.life <= 0 ||
+        p.x < tdGeom.gridX - 48 ||
+        p.x > tdWidth + 48 ||
+        p.y < -42 ||
+        p.y > tdHeight + 42
+      ) {
+        tdState.projectiles.splice(i, 1);
+        continue;
+      }
+
+      let hit = false;
+      for (let zi = tdState.zombies.length - 1; zi >= 0; zi -= 1) {
+        const zombie = tdState.zombies[zi];
+        const dx = zombie.x - p.x;
+        const dy = zombie.y - p.y;
+        if (dx * dx + dy * dy <= (zombie.r + 3.5) * (zombie.r + 3.5)) {
+          tdApplyZombieHit(zi, p.damage);
+          hit = true;
+          break;
+        }
+      }
+
+      if (hit) {
+        tdState.projectiles.splice(i, 1);
+      }
+    }
+  }
+
+  function tdUpdateZombies(dt, now) {
+    if (tdState.zombies.length === 0) return;
+    const points = tdGeom.pathPoints;
+    if (!points || points.length < 2) return;
+
+    for (let i = tdState.zombies.length - 1; i >= 0; i -= 1) {
+      const zombie = tdState.zombies[i];
+      let remaining = zombie.speed * dt;
+      while (remaining > 0 && zombie.waypoint < points.length) {
+        const target = points[zombie.waypoint];
+        const dx = target.x - zombie.x;
+        const dy = target.y - zombie.y;
+        const dist = Math.hypot(dx, dy) || 0.0001;
+        if (remaining >= dist) {
+          zombie.x = target.x;
+          zombie.y = target.y;
+          zombie.progress += dist;
+          remaining -= dist;
+          zombie.waypoint += 1;
+        } else {
+          const nx = dx / dist;
+          const ny = dy / dist;
+          zombie.x += nx * remaining;
+          zombie.y += ny * remaining;
+          zombie.progress += remaining;
+          remaining = 0;
+        }
+      }
+
+      if (zombie.waypoint >= points.length) {
+        tdState.zombies.splice(i, 1);
+        tdState.baseHp = Math.max(0, tdState.baseHp - 1);
+        tdState.effects.push({
+          x: tdGeom.baseX,
+          y: tdGeom.baseY,
+          life: 0.42,
+          max: 0.42,
+          kind: "base-hit",
+        });
+        tdPushHint("Зомби прорвался к базе: -1 HP.", "error");
+        tdUpdateUi();
+        tdSave();
+        if (tdState.baseHp <= 0) {
+          tdGameOver();
+          return;
+        }
+      }
+    }
+  }
+
+  function tdUpdateEffects(dt) {
+    for (let i = tdState.effects.length - 1; i >= 0; i -= 1) {
+      const effect = tdState.effects[i];
+      effect.life -= dt;
+      if (effect.life <= 0) {
+        tdState.effects.splice(i, 1);
+      }
+    }
+  }
+
+  function tdUpdate(dt, now) {
+    if (
+      tdState.profileGoldBuffer > 0 &&
+      now - (tdState.lastProfileGoldFlushAt || 0) >= 1500
+    ) {
+      tdFlushProfileGold();
+      tdState.lastProfileGoldFlushAt = now;
+    }
+
+    if (!tdState.running && !tdState.waveActive) {
+      tdUpdateEffects(dt);
+      return;
+    }
+
+    tdUpdateWave(dt);
+    tdUpdateCores(dt);
+    tdUpdateProjectiles(dt);
+    tdUpdateZombies(dt, now);
+    tdUpdateEffects(dt);
+  }
+
+  function tdDrawBackground(now) {
+    const bg = tdCtx.createLinearGradient(0, 0, 0, tdHeight);
+    bg.addColorStop(0, "#1f262d");
+    bg.addColorStop(1, "#131a20");
+    tdCtx.fillStyle = bg;
+    tdCtx.fillRect(0, 0, tdWidth, tdHeight);
+
+    const grainCount = Math.floor((tdWidth * tdHeight) / 8500);
+    tdCtx.fillStyle = "rgba(255, 255, 255, 0.03)";
+    for (let i = 0; i < grainCount; i += 1) {
+      const gx = (i * 73.1 + now * 0.01) % tdWidth;
+      const gy = (i * 41.7 + now * 0.016) % tdHeight;
+      tdCtx.fillRect(gx, gy, 1.2, 1.2);
+    }
+
+    const framePad = tdClamp(tdWidth * 0.02, 8, 16);
+    const frameX = tdGeom.gridX - framePad;
+    const frameY = tdGeom.gridY - framePad;
+    const frameW = tdGeom.gridW + framePad * 2;
+    const frameH = tdGeom.gridH + framePad * 2;
+    tdRoundRectPath(frameX, frameY, frameW, frameH, 20);
+    tdCtx.fillStyle = "#d3c8b0";
+    tdCtx.fill();
+    tdCtx.strokeStyle = "#eee0c0";
+    tdCtx.lineWidth = 2.5;
+    tdCtx.stroke();
+
+    tdRoundRectPath(tdGeom.gridX, tdGeom.gridY, tdGeom.gridW, tdGeom.gridH, 14);
+    tdCtx.fillStyle = "#8cbc58";
+    tdCtx.fill();
+    tdCtx.strokeStyle = "rgba(67, 111, 47, 0.9)";
+    tdCtx.lineWidth = 1.6;
+    tdCtx.stroke();
+
+    const points = tdGeom.pathPoints || [];
+    if (points.length >= 2) {
+      tdCtx.lineCap = "round";
+      tdCtx.lineJoin = "round";
+      tdCtx.strokeStyle = "rgba(69, 49, 31, 0.95)";
+      tdCtx.lineWidth = tdGeom.pathWidth + 10;
+      tdCtx.beginPath();
+      tdCtx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i += 1) tdCtx.lineTo(points[i].x, points[i].y);
+      tdCtx.stroke();
+
+      tdCtx.strokeStyle = "#8f6945";
+      tdCtx.lineWidth = tdGeom.pathWidth;
+      tdCtx.beginPath();
+      tdCtx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i += 1) tdCtx.lineTo(points[i].x, points[i].y);
+      tdCtx.stroke();
+
+      tdCtx.strokeStyle = "rgba(232, 210, 174, 0.38)";
+      tdCtx.lineWidth = 1.2;
+      tdCtx.beginPath();
+      tdCtx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i += 1) tdCtx.lineTo(points[i].x, points[i].y);
+      tdCtx.stroke();
+    }
+  }
+
+  function tdDrawGrid() {
+    for (let row = 0; row < TD_ROWS; row += 1) {
+      for (let col = 0; col < TD_COLS; col += 1) {
+        const index = row * TD_COLS + col;
+        const x = tdGeom.gridX + col * tdGeom.cellW + 3;
+        const y = tdGeom.gridY + row * tdGeom.cellH + 3;
+        const w = tdGeom.cellW - 6;
+        const h = tdGeom.cellH - 6;
+        const isSelected = index === tdState.selectedCell;
+
+        tdRoundRectPath(x, y, w, h, 10);
+        tdCtx.fillStyle = (row + col) % 2 === 0 ? "#9ad255" : "#8ac94a";
+        tdCtx.fill();
+        tdCtx.strokeStyle = isSelected
+          ? "rgba(107, 223, 255, 0.95)"
+          : "rgba(70, 119, 49, 0.45)";
+        tdCtx.lineWidth = isSelected ? 2.2 : 1.2;
+        tdCtx.stroke();
+
+        if (isSelected) {
+          tdRoundRectPath(x + 2.5, y + 2.5, w - 5, h - 5, 8);
+          tdCtx.strokeStyle = "rgba(244, 253, 255, 0.92)";
+          tdCtx.lineWidth = 1.2;
+          tdCtx.stroke();
+        }
+      }
+    }
+  }
+
+  function tdDrawBase() {
+    const hpRatio = tdClamp(tdState.baseHp / TD_MAX_BASE_HP, 0, 1);
+    const gateW = 28;
+    const gateH = 38;
+    const gx = tdGeom.baseX - gateW * 0.5;
+    const gy = tdGeom.baseY - gateH * 0.5;
+    tdRoundRectPath(gx, gy, gateW, gateH, 8);
+    tdCtx.fillStyle = "#d4ccb6";
+    tdCtx.fill();
+    tdCtx.strokeStyle = "#f6eed8";
+    tdCtx.lineWidth = 2;
+    tdCtx.stroke();
+
+    tdRoundRectPath(gx + 5, gy + 8, gateW - 10, gateH - 12, 5);
+    tdCtx.fillStyle = "#7a5a3e";
+    tdCtx.fill();
+
+    const pulse = 0.35 + (Math.sin(performance.now() * 0.008) * 0.5 + 0.5) * 0.25;
+    tdCtx.beginPath();
+    tdCtx.arc(tdGeom.baseX, tdGeom.baseY, tdGeom.baseR + 7, 0, Math.PI * 2);
+    tdCtx.strokeStyle = `rgba(255, 226, 127, ${pulse})`;
+    tdCtx.lineWidth = 2.2;
+    tdCtx.stroke();
+
+    const barW = 88;
+    const barH = 8;
+    const bx = tdGeom.baseX - barW * 0.5;
+    const by = tdGeom.baseY - tdGeom.baseR - 22;
+    tdRoundRectPath(bx, by, barW, barH, 5);
+    tdCtx.fillStyle = "rgba(44, 40, 31, 0.82)";
+    tdCtx.fill();
+    tdRoundRectPath(bx, by, barW * hpRatio, barH, 5);
+    tdCtx.fillStyle = hpRatio > 0.35 ? "#6cf68f" : "#ff7d70";
+    tdCtx.fill();
+  }
+
+  function tdDrawCores() {
+    const draggingSource =
+      tdState.drag.active && Number.isInteger(tdState.drag.sourceCell)
+        ? tdState.drag.sourceCell
+        : -1;
+
+    for (let i = 0; i < tdState.cores.length; i += 1) {
+      if (i === draggingSource) continue;
+      const core = tdState.cores[i];
+      if (!core) continue;
+      const pos = tdCellToPosition(i);
+      const color = tdCoreColor(core.rank);
+      const recoilOffset = core.recoil * 4.5;
+      const turretLen = 14 + core.rank * 1.5;
+      const ax = Math.cos(core.aim || 0);
+      const ay = Math.sin(core.aim || 0);
+
+      tdCtx.beginPath();
+      tdCtx.arc(pos.x, pos.y, 17, 0, Math.PI * 2);
+      tdCtx.fillStyle = "rgba(24, 47, 35, 0.3)";
+      tdCtx.fill();
+
+      tdCtx.beginPath();
+      tdCtx.arc(pos.x, pos.y, 13, 0, Math.PI * 2);
+      tdCtx.fillStyle = "rgba(255, 255, 255, 0.88)";
+      tdCtx.fill();
+      tdCtx.strokeStyle = color;
+      tdCtx.lineWidth = 2.4;
+      tdCtx.stroke();
+
+      tdCtx.beginPath();
+      tdCtx.moveTo(pos.x, pos.y);
+      tdCtx.lineTo(
+        pos.x + ax * (turretLen - recoilOffset),
+        pos.y + ay * (turretLen - recoilOffset)
+      );
+      tdCtx.strokeStyle = "rgba(50, 53, 58, 0.95)";
+      tdCtx.lineWidth = 5.4;
+      tdCtx.lineCap = "round";
+      tdCtx.stroke();
+
+      tdCtx.beginPath();
+      tdCtx.moveTo(pos.x, pos.y);
+      tdCtx.lineTo(
+        pos.x + ax * (turretLen - recoilOffset),
+        pos.y + ay * (turretLen - recoilOffset)
+      );
+      tdCtx.strokeStyle = color;
+      tdCtx.lineWidth = 2.2;
+      tdCtx.lineCap = "round";
+      tdCtx.stroke();
+
+      tdCtx.font = "13px 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif";
+      tdCtx.textAlign = "center";
+      tdCtx.fillText(tdCoreIcon(core.rank), pos.x, pos.y + 4.5);
+      tdCtx.font = "600 10px 'Space Grotesk', sans-serif";
+      tdCtx.fillStyle = "rgba(34, 66, 52, 0.95)";
+      tdCtx.fillText(`R${core.rank}`, pos.x, pos.y - 16);
+      tdCtx.fillStyle = "#f3ffea";
+      tdCtx.fillText(`L${core.level}`, pos.x, pos.y + 18.5);
+    }
+
+    if (draggingSource >= 0) {
+      const dragCore = tdState.cores[draggingSource];
+      if (dragCore) {
+        const color = tdCoreColor(dragCore.rank);
+        const x = tdState.drag.pointerX;
+        const y = tdState.drag.pointerY;
+        tdCtx.globalAlpha = 0.86;
+        tdCtx.beginPath();
+        tdCtx.arc(x, y, 15, 0, Math.PI * 2);
+        tdCtx.fillStyle = "rgba(255, 255, 255, 0.88)";
+        tdCtx.fill();
+        tdCtx.strokeStyle = color;
+        tdCtx.lineWidth = 2.6;
+        tdCtx.stroke();
+        tdCtx.font = "13px 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif";
+        tdCtx.textAlign = "center";
+        tdCtx.fillText(tdCoreIcon(dragCore.rank), x, y + 4.5);
+        tdCtx.globalAlpha = 1;
+      }
+    }
+  }
+
+  function tdDrawZombies(now) {
+    tdCtx.textAlign = "center";
+    for (let i = 0; i < tdState.zombies.length; i += 1) {
+      const z = tdState.zombies[i];
+      const wobble = Math.sin(now * 0.004 + z.bob) * 1.2;
+      const radius = z.r;
+      const x = z.x;
+      const y = z.y + wobble * 0.14;
+      const hpRatio = tdClamp(z.hp / z.maxHp, 0, 1);
+
+      tdCtx.beginPath();
+      tdCtx.arc(x, y, radius + 6, 0, Math.PI * 2);
+      tdCtx.fillStyle = "rgba(56, 119, 79, 0.25)";
+      tdCtx.fill();
+
+      tdCtx.beginPath();
+      tdCtx.arc(x, y, radius, 0, Math.PI * 2);
+      tdCtx.fillStyle = "#2f9f64";
+      tdCtx.fill();
+      tdCtx.strokeStyle = "#bbffd0";
+      tdCtx.lineWidth = 1.7;
+      tdCtx.stroke();
+
+      tdCtx.fillStyle = "#dfffa8";
+      tdCtx.beginPath();
+      tdCtx.arc(x - radius * 0.23, y - radius * 0.14, 2.2, 0, Math.PI * 2);
+      tdCtx.arc(x + radius * 0.23, y - radius * 0.14, 2.2, 0, Math.PI * 2);
+      tdCtx.fill();
+
+      tdCtx.fillStyle = "rgba(36, 79, 52, 0.95)";
+      tdCtx.beginPath();
+      tdCtx.arc(x - radius * 0.23, y - radius * 0.14, 0.8, 0, Math.PI * 2);
+      tdCtx.arc(x + radius * 0.23, y - radius * 0.14, 0.8, 0, Math.PI * 2);
+      tdCtx.fill();
+
+      const barW = Math.max(20, radius * 2.2);
+      const barH = 5.5;
+      const bx = x - barW * 0.5;
+      const by = y - radius - 10;
+      tdRoundRectPath(bx, by, barW, barH, 3);
+      tdCtx.fillStyle = "rgba(34, 42, 33, 0.8)";
+      tdCtx.fill();
+      tdRoundRectPath(bx, by, barW * hpRatio, barH, 3);
+      tdCtx.fillStyle = "#ff6678";
+      tdCtx.fill();
+
+      tdCtx.font = "700 9px 'Space Grotesk', sans-serif";
+      tdCtx.fillStyle = "#f8fff4";
+      tdCtx.fillText(`${Math.ceil(z.hp)}/${Math.ceil(z.maxHp)}`, x, by - 2.5);
+    }
+  }
+
+  function tdDrawProjectiles() {
+    for (let i = 0; i < tdState.projectiles.length; i += 1) {
+      const p = tdState.projectiles[i];
+      tdCtx.beginPath();
+      tdCtx.arc(p.x, p.y, 3.5, 0, Math.PI * 2);
+      tdCtx.fillStyle = p.color || "#ffd188";
+      tdCtx.fill();
+      tdCtx.beginPath();
+      tdCtx.arc(p.x, p.y, 8.6, 0, Math.PI * 2);
+      tdCtx.fillStyle = "rgba(255, 230, 140, 0.26)";
+      tdCtx.fill();
+    }
+  }
+
+  function tdDrawEffects() {
+    for (let i = 0; i < tdState.effects.length; i += 1) {
+      const effect = tdState.effects[i];
+      const t = tdClamp(effect.life / effect.max, 0, 1);
+      if (effect.kind === "spawn") {
+        tdCtx.beginPath();
+        tdCtx.arc(effect.x, effect.y, 34 * (1 - t), 0, Math.PI * 2);
+        tdCtx.strokeStyle = `rgba(111, 226, 176, ${t * 0.7})`;
+        tdCtx.lineWidth = 2;
+        tdCtx.stroke();
+      } else if (effect.kind === "merge") {
+        tdCtx.beginPath();
+        tdCtx.arc(effect.x, effect.y, 42 * (1 - t * 0.4), 0, Math.PI * 2);
+        tdCtx.strokeStyle = `rgba(255, 214, 118, ${t * 0.8})`;
+        tdCtx.lineWidth = 3;
+        tdCtx.stroke();
+      } else if (effect.kind === "base-hit") {
+        tdCtx.beginPath();
+        tdCtx.arc(effect.x, effect.y, 58 * (1 - t * 0.25), 0, Math.PI * 2);
+        tdCtx.strokeStyle = `rgba(255, 95, 95, ${t * 0.8})`;
+        tdCtx.lineWidth = 4;
+        tdCtx.stroke();
+      } else if (effect.kind === "muzzle") {
+        tdCtx.beginPath();
+        tdCtx.arc(effect.x, effect.y, 7 * t, 0, Math.PI * 2);
+        tdCtx.fillStyle = effect.color || `rgba(255, 202, 128, ${t * 0.7})`;
+        tdCtx.fill();
+      } else if (effect.kind === "hit" || effect.kind === "kill") {
+        tdCtx.beginPath();
+        tdCtx.arc(effect.x, effect.y, (effect.kind === "kill" ? 22 : 12) * (1 - t * 0.35), 0, Math.PI * 2);
+        tdCtx.strokeStyle =
+          effect.kind === "kill"
+            ? `rgba(255, 198, 120, ${t * 0.9})`
+            : `rgba(111, 226, 176, ${t * 0.6})`;
+        tdCtx.lineWidth = effect.kind === "kill" ? 2.4 : 1.8;
+        tdCtx.stroke();
+      }
+    }
+  }
+
+  function tdDrawTopInfo() {
+    const queueLeft = tdState.spawnQueue.length;
+    const live = tdState.zombies.length;
+    const status = tdState.waveActive
+      ? `Волна ${tdState.wave}`
+      : tdState.over
+        ? "Поражение"
+        : "Подготовка";
+
+    tdCtx.font = "700 14px 'Space Grotesk', sans-serif";
+    tdCtx.textAlign = "left";
+    tdCtx.fillStyle = "rgba(34, 52, 45, 0.96)";
+    tdCtx.fillText(status, tdGeom.gridX, tdGeom.pad + 12);
+
+    tdCtx.font = "600 12px 'Space Grotesk', sans-serif";
+    tdCtx.fillStyle = "rgba(38, 58, 45, 0.88)";
+    tdCtx.fillText(`В пути: ${queueLeft}  На поле: ${live}`, tdGeom.gridX + 92, tdGeom.pad + 12);
+
+    const hearts = Math.max(0, tdState.baseHp);
+    tdCtx.textAlign = "right";
+    tdCtx.font = "14px 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif";
+    const heartCount = Math.max(1, Math.ceil(hearts / 2));
+    tdCtx.fillText("❤️".repeat(Math.min(heartCount, 5)), tdGeom.gridX + tdGeom.gridW, tdGeom.pad + 12);
+
+    const skullCount = Math.min(14, queueLeft + live);
+    const skullSpacing = 14;
+    const skullStartX = tdGeom.gridX + 8;
+    const skullY = Math.max(20, tdGeom.gridY - 14);
+    for (let i = 0; i < skullCount; i += 1) {
+      const x = skullStartX + i * skullSpacing;
+      tdCtx.beginPath();
+      tdCtx.arc(x, skullY, 5.2, 0, Math.PI * 2);
+      tdCtx.fillStyle = "rgba(232, 248, 202, 0.82)";
+      tdCtx.fill();
+      tdCtx.beginPath();
+      tdCtx.arc(x - 1.6, skullY - 1, 0.9, 0, Math.PI * 2);
+      tdCtx.arc(x + 1.6, skullY - 1, 0.9, 0, Math.PI * 2);
+      tdCtx.fillStyle = "rgba(70, 96, 72, 0.9)";
+      tdCtx.fill();
+    }
+  }
+
+  function tdRender(now) {
+    tdCtx.clearRect(0, 0, tdWidth, tdHeight);
+    tdDrawBackground(now);
+    tdDrawGrid();
+    tdDrawBase();
+    tdDrawProjectiles();
+    tdDrawCores();
+    tdDrawZombies(now);
+    tdDrawEffects();
+    tdDrawTopInfo();
+  }
+
+  function tdShouldRunLoop() {
+    if (modeState.page === 1) return true;
+    if (tdState.running || tdState.waveActive) return true;
+    if (tdState.zombies.length > 0 || tdState.projectiles.length > 0 || tdState.effects.length > 0) return true;
+    return false;
+  }
+
+  function tdScheduleTick() {
+    if (tdRafId) return;
+    tdRafId = requestAnimationFrame(tdTick);
+  }
+
+  function tdTick(now) {
+    tdRafId = 0;
+    if (!tdShouldRunLoop()) {
+      tdLastTime = now;
+      return;
+    }
+    const dt = Math.min(0.033, (now - tdLastTime) / 1000);
+    tdLastTime = now;
+    try {
+      tdUpdate(dt, now);
+      tdRender(now);
+    } catch (error) {
+      console.error("TD mode runtime error:", error);
+      tdState.running = false;
+      tdState.waveActive = false;
+      tdShowOverlay(
+        "Ошибка режима",
+        "Режим временно остановлен из-за ошибки. Нажми «Играть», чтобы перезапустить.",
+        "Играть"
+      );
+    }
+    tdScheduleTick();
+  }
+
+  function tdPointerToCanvas(event) {
+    const rect = tdCanvas.getBoundingClientRect();
+    return {
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top,
+    };
+  }
+
+  tdCanvas.addEventListener("pointerdown", (event) => {
+    const pos = tdPointerToCanvas(event);
+    const cellIndex = tdGetCellAt(pos.x, pos.y);
+    if (cellIndex >= 0 && tdState.cores[cellIndex]) {
+      tdSelectCell(cellIndex);
+      tdState.drag.active = true;
+      tdState.drag.sourceCell = cellIndex;
+      tdState.drag.pointerId = event.pointerId;
+      tdState.drag.pointerX = pos.x;
+      tdState.drag.pointerY = pos.y;
+      try {
+        tdCanvas.setPointerCapture(event.pointerId);
+      } catch (error) {
+        // ignore
+      }
+      return;
+    }
+    if (cellIndex >= 0) {
+      tdSelectCell(cellIndex);
+      return;
+    }
+    tdState.selectedCell = null;
+    tdUpdateUi();
+  });
+
+  tdCanvas.addEventListener("pointermove", (event) => {
+    if (!tdState.drag.active || tdState.drag.pointerId !== event.pointerId) return;
+    const pos = tdPointerToCanvas(event);
+    tdState.drag.pointerX = pos.x;
+    tdState.drag.pointerY = pos.y;
+  });
+
+  const tdFinishDrag = (event, cancel = false) => {
+    if (!tdState.drag.active || tdState.drag.pointerId !== event.pointerId) return;
+    const sourceCell = tdState.drag.sourceCell;
+    const pos = tdPointerToCanvas(event);
+    const targetCell = tdGetCellAt(pos.x, pos.y);
+    tdState.drag.active = false;
+    tdState.drag.sourceCell = -1;
+    tdState.drag.pointerId = null;
+    if (cancel) {
+      tdSelectCell(sourceCell);
+      return;
+    }
+    tdDropCore(sourceCell, targetCell);
+  };
+
+  tdCanvas.addEventListener("pointerup", (event) => {
+    tdFinishDrag(event, false);
+  });
+
+  tdCanvas.addEventListener("pointercancel", (event) => {
+    tdFinishDrag(event, true);
+  });
+
+  if (tdBuyBtn) tdBuyBtn.addEventListener("click", tdBuyCore);
+  if (tdUpgradeBtn) tdUpgradeBtn.addEventListener("click", tdUpgradeSelected);
+  if (tdStartWaveBtn) tdStartWaveBtn.addEventListener("click", tdStartWave);
+  if (tdOverlayBtn) {
+    tdOverlayBtn.addEventListener("click", () => {
+      if (tdState.over) {
+        tdReset();
+      }
+      tdStartWave();
+    });
+  }
+
+  function setModePage(page) {
+    const nextPage = tdClamp(Math.round(page), 0, 1);
+    modeState.page = nextPage;
+    modePager.classList.toggle("page-1", nextPage === 1);
+    modeTabs.forEach((tab) => {
+      const tabPage = Number(tab.dataset.modePage);
+      tab.classList.toggle("active", tabPage === nextPage);
+    });
+    if (nextPage === 1 && state.status === "running") {
+      pauseGame();
+    }
+    requestAnimationFrame(tdResizeCanvas);
+    tdScheduleTick();
+  }
+
+  modeTabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      setModePage(Number(tab.dataset.modePage) || 0);
+    });
+  });
+
+  function canSwipeStart(target) {
+    if (!(target instanceof Element)) return true;
+    if (modeState.page === 0 && target.closest("#gameCanvas") && state.status === "running") {
+      return false;
+    }
+    if (modeState.page === 1 && target.closest("#tdCanvas") && tdState.running) {
+      return false;
+    }
+    return true;
+  }
+
+  modePager.addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary) return;
+    if (event.pointerType === "mouse") return;
+    if (!canSwipeStart(event.target)) return;
+    modeState.swipeActive = true;
+    modeState.pointerId = event.pointerId;
+    modeState.startX = event.clientX;
+    modeState.startY = event.clientY;
+  });
+
+  modePager.addEventListener("pointerup", (event) => {
+    if (!modeState.swipeActive || modeState.pointerId !== event.pointerId) return;
+    modeState.swipeActive = false;
+    const dx = event.clientX - modeState.startX;
+    const dy = event.clientY - modeState.startY;
+    if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.35) {
+      if (dx < 0) {
+        setModePage(modeState.page + 1);
+      } else {
+        setModePage(modeState.page - 1);
+      }
+    }
+  });
+
+  modePager.addEventListener("pointercancel", () => {
+    modeState.swipeActive = false;
+  });
+
+  modePager.addEventListener("pointerleave", () => {
+    modeState.swipeActive = false;
+  });
+
+  tdLoad();
+  if (tdState.over) {
+    tdShowOverlay(
+      "База уничтожена",
+      `Ты продержался до волны ${tdState.wave}. Нажми, чтобы начать заново.`,
+      "Заново"
+    );
+  } else {
+    tdShowOverlay(
+      "Готов к волне?",
+      "Построй оборону на сетке 5x3 и не дай зомби пройти к базе.",
+      "Играть"
+    );
+  }
+  tdUpdateUi();
+  tdResizeCanvas();
+  tdScheduleTick();
+  window.addEventListener("resize", tdResizeCanvas);
+  setModePage(0);
+})();

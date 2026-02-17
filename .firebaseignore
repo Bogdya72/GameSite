@@ -1,0 +1,14 @@
+firebase.json
+.firebaserc
+.firebaseignore
+**/.*
+**/node_modules/**
+.firebase/**
+.git/**
+*.md
+**/*.md
+database.rules.json
+DEPLOY.md
+GOOGLE_AUTH_SETUP.md
+WS_COOP_SETUP.md
+ws-server/**

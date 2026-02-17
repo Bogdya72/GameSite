@@ -73,6 +73,10 @@ function sanitizeWeapon(value) {
   return WEAPONS[key] ? key : "blaster";
 }
 
+function sanitizeBeamDps(value) {
+  return clamp(value, 0.5, 80);
+}
+
 function getStore(kind) {
   return kind === "world" ? worlds : rooms;
 }
@@ -262,6 +266,7 @@ function sanitizeRoomPatch(current, patch) {
         "aimY",
         "pointerDown",
         "weapon",
+        "beamDps",
         "shotSeq",
         "inputAt",
         "updatedAt",
@@ -518,7 +523,7 @@ function processPlayerFire(sim, role, dt, now) {
       player.y,
       target.x,
       target.y,
-      WEAPONS.beam.dps * dt,
+      sanitizeBeamDps(player.beamDps) * dt,
       now,
       WEAPONS.beam.width * 0.55,
       3
@@ -680,6 +685,7 @@ function syncPlayerInputFromRoom(sim, room, role) {
   }
 
   player.weapon = sanitizeWeapon(slot.weapon || player.weapon);
+  player.beamDps = sanitizeBeamDps(slot.beamDps ?? player.beamDps ?? WEAPONS.beam.dps);
   player.aimX = quantizeNorm(slot.aimX ?? player.aimX);
   player.aimY = quantizeNorm(slot.aimY ?? player.aimY);
   player.pointerDown = Boolean(slot.pointerDown) && player.alive;
@@ -691,6 +697,7 @@ function syncPlayerInputFromRoom(sim, room, role) {
   player.shotSeq = seq;
 
   slot.weapon = player.weapon;
+  slot.beamDps = player.beamDps;
   slot.aimX = player.aimX;
   slot.aimY = player.aimY;
   slot.pointerDown = player.pointerDown;
@@ -711,6 +718,7 @@ function createPlayerState(role, roomSlot, coords) {
     alive: hp > 0,
     score: Math.max(0, Math.floor(Number(roomSlot?.score) || 0)),
     weapon: sanitizeWeapon(roomSlot?.weapon),
+    beamDps: sanitizeBeamDps(roomSlot?.beamDps ?? WEAPONS.beam.dps),
     aimX: quantizeNorm(roomSlot?.aimX ?? 0.5),
     aimY: quantizeNorm(roomSlot?.aimY ?? 0.5),
     pointerDown: Boolean(roomSlot?.pointerDown),
