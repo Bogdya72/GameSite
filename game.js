@@ -953,7 +953,9 @@ function applyCoopWorldSnapshot(world) {
       const rNorm = clamp((Number(zombie[3]) || 0) / 10000, 0.003, 0.3);
       incomingX = xNorm * targetWidth;
       incomingY = yNorm * targetHeight;
-      incomingR = Math.max(8, rNorm * targetMin);
+      incomingR = wsMirrorMode
+        ? Math.max(12, rNorm * sourceMin)
+        : Math.max(8, rNorm * targetMin);
       incomingHp = Math.max(0, (Number(zombie[4]) || 0) / 10);
       incomingMaxHp = Math.max(1, (Number(zombie[5]) || 10) / 10);
       incomingType = ZOMBIE_CODE_TO_TYPE[Math.round(Number(zombie[6]) || 0)] || "normal";
@@ -962,7 +964,9 @@ function applyCoopWorldSnapshot(world) {
       incomingId = Math.max(1, Number(zombie.i ?? zombie.id) || index + 1);
       incomingX = (Number(zombie.x) || 0) * scaleX;
       incomingY = (Number(zombie.y) || 0) * scaleY;
-      incomingR = Math.max(8, (Number(zombie.r) || 14) * radiusScale);
+      incomingR = wsMirrorMode
+        ? Math.max(12, Number(zombie.r) || 14)
+        : Math.max(8, (Number(zombie.r) || 14) * radiusScale);
       incomingHp = Math.max(0, Number(zombie.h ?? zombie.hp) || 0);
       incomingMaxHp = Math.max(1, Number(zombie.m ?? zombie.maxHp) || 1);
       incomingType = String(zombie.t || zombie.type || "normal");
@@ -1053,7 +1057,9 @@ function applyCoopWorldSnapshot(world) {
           y: yNorm * targetHeight,
           vx: vxNorm * 2200,
           vy: vyNorm * 2200,
-          r: Math.max(2, rNorm * targetMin),
+          r: wsMirrorMode
+            ? Math.max(3.2, rNorm * sourceMin)
+            : Math.max(2, rNorm * targetMin),
           life: Math.max(0.08, life100 / 100),
           damage: 0,
           splash: typeCode === 1 ? (WEAPONS.grenade.splash || 70) : 0,
@@ -1066,7 +1072,9 @@ function applyCoopWorldSnapshot(world) {
           y: (Number(bullet.y) || 0) * scaleY,
           vx: Number(bullet.vx) || 0,
           vy: Number(bullet.vy) || 0,
-          r: Math.max(2, (Number(bullet.r) || 3) * radiusScale),
+          r: wsMirrorMode
+            ? Math.max(3.2, Number(bullet.r) || 3)
+            : Math.max(2, (Number(bullet.r) || 3) * radiusScale),
           life: Math.max(0.08, Number(bullet.life) || 0.4),
           damage: 0,
           splash: Number(bullet.splash) || 0,
@@ -5057,6 +5065,14 @@ function shoot(targetX, targetY, now) {
   
   // Muzzle flash!
   state.muzzleFlash = 1;
+  const wsAuthoritativeMirror = isCoopWsEnabled() && isGuestMirrorMode();
+
+  if (wsAuthoritativeMirror && coopState.active && coopState.roomStatus === "running") {
+    coopState.localShotSeq = Math.max(0, Math.floor(coopState.localShotSeq || 0)) + 1;
+    syncCoopState(performance.now(), true);
+    playShotSound();
+    return;
+  }
 
   const ownCore = getOwnCorePosition();
   const originX = ownCore.x;
@@ -5386,6 +5402,14 @@ function applyRemoteRayDamage(
 }
 
 function applyRemoteSupportFire(dt, now) {
+  if (isCoopWsEnabled()) {
+    coopState.remoteBeamActive = false;
+    coopState.remoteBeamTarget = null;
+    if (Array.isArray(coopState.remoteTracers) && coopState.remoteTracers.length > 0) {
+      coopState.remoteTracers.length = 0;
+    }
+    return;
+  }
   const canSimulateRemoteFire = state.status === "running" || shouldRunHostKoSimulation();
   if (!isDualCoreBattleActive() || !coopState.remoteConnected || !coopState.remoteAlive || !canSimulateRemoteFire) {
     coopState.remoteBeamActive = false;
